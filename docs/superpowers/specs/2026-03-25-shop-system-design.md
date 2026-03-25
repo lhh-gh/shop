@@ -2670,7 +2670,7 @@ protected final function createPaymentRecord(Order $order, string $payScene): Pa
 | 回调来源 | GatewaySignatureVerify 中间件验签确认请求来源真实性 |
 | 金额校验 | 回调处理时必须比对金额，不一致则拒绝并告警 |
 | 日志脱敏 | 日志中不记录完整的私钥、签名串、回调原文，只记录关键业务字段 |
-| 环境隔离 | 微信/支付宝沙箱环境用于开发测试，通过 .env 切换 |
+| 环境隔离 | 支付宝使用沙箱环境联调（sandbox 账号+沙箱 APP，不扣真钱）；微信支付 v3 无独立沙箱，使用 1 分钱真实交易联调，测完退款。通过 .env 切换 API 地址和密钥 |
 | 密钥轮换 | 支持多证书共存（微信 serial_no 区分），轮换时新旧证书并行 |
 
 ### 4.1 用户认证相关（5 张表）
