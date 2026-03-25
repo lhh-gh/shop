@@ -14,12 +14,14 @@
 
 ### 客户端平台
 
-| 平台标识 | 说明 |
-|---------|------|
-| `app` | 原生 APP (iOS/Android) |
-| `mini_program` | 微信/支付宝小程序 |
-| `h5` | H5 移动网页 |
-| `pc` | PC 网页端 |
+| 平台标识 | 说明 | 技术方案 |
+|---------|------|---------|
+| `app` | 原生 APP (iOS/Android) | uniapp 或 flutter |
+| `mini_program` | 微信/支付宝小程序 | uniapp 或原生小程序 |
+| `h5` | H5 移动网页 | uniapp H5 或独立前端 |
+| `pc` | PC 网页端 | Web 前端 |
+
+> APP 端使用 uniapp 或 flutter 开发，省市区等字典数据由客户端本地维护，服务端仅提供纯 API 接口。
 
 ## 2. 用户认证体系
 
@@ -1372,6 +1374,214 @@ class UserResource extends JsonResource
 
 永远不在响应中返回 password、第三方 access_token/refresh_token 等敏感字段。`has_password` 布尔值用于前端判断是"修改密码"还是"设置密码"流程。
 
+### 2.11 收货地址维护（详细设计）
+
+#### 2.11.1 业务规则
+
+| 规则 | 说明 |
+|------|------|
+| 地址上限 | 每个用户最多 **20** 条收货地址 |
+| 默认地址 | 有且仅有 1 条默认地址 |
+| 自动默认 | 用户的第一条地址自动设为默认 |
+| 默认补位 | 删除默认地址后，自动将最近修改的地址设为默认 |
+| 物理删除 | 地址删除为物理删除（不软删），历史订单通过 `address_snapshot` 保留 |
+| 省市区数据 | 客户端本地维护行政区划字典（uniapp/flutter 内置地区选择器），服务端只校验非空 |
+| 订单快照 | 下单时完整复制地址到 `orders.address_snapshot` JSON，地址后续修改/删除不影响历史订单 |
+
+#### 2.11.2 字段校验规则
+
+| 字段 | 规则 | 说明 |
+|------|------|------|
+| name | 必填，2-50 字符 | 收货人姓名 |
+| phone | 必填，正则 `/^1[3-9]\d{9}$/` | 收货手机号 |
+| province | 必填 | 由客户端地区选择器提供 |
+| city | 必填 | 由客户端地区选择器提供 |
+| district | 必填 | 由客户端地区选择器提供 |
+| address | 必填，5-255 字符 | 详细地址（楼栋门牌号等） |
+| is_default | 可选，布尔值，默认 false | 是否设为默认地址 |
+
+#### 2.11.3 接口详细设计
+
+**（1）获取地址列表 `GET /user/addresses`**
+
+```
+客户端                                   服务端
+  │                                       │
+  │  GET /user/addresses                  │
+  │──────────────────────────────────────→│
+  │                                       │ 查询当前用户所有地址
+  │                                       │ ORDER BY is_default DESC, updated_at DESC
+  │     200 [{脱敏地址}, ...]              │ 默认地址排第一
+  │←──────────────────────────────────────│
+```
+
+返回脱敏的 `UserAddressResource` 集合（name/phone/address 脱敏）。
+
+**（2）获取单条地址 `GET /user/addresses/{id}`（编辑用，不脱敏）**
+
+```
+客户端                                   服务端
+  │                                       │
+  │  GET /user/addresses/42               │
+  │──────────────────────────────────────→│
+  │                                       │ 1. 查询 WHERE id=42 AND user_id=当前用户
+  │                                       │ 2. 不匹配返回 404（防越权）
+  │     200 {完整地址}                     │ 使用 UserAddressResource::unmasked()
+  │←──────────────────────────────────────│
+```
+
+**（3）创建地址 `POST /user/addresses`**
+
+```
+客户端                                   服务端
+  │                                       │
+  │  POST /user/addresses                 │
+  │  {name, phone, province, city,        │
+  │   district, address, is_default}      │
+  │──────────────────────────────────────→│
+  │                                       │ 1. 校验字段格式
+  │                                       │ 2. 检查地址数量 ≤ 20，否则 422
+  │                                       │ 3. 事务：
+  │                                       │    a. 若 is_default=true 或无其他地址：
+  │                                       │       清除旧默认
+  │                                       │    b. INSERT 新地址
+  │     201 {脱敏地址}                     │
+  │←──────────────────────────────────────│
+```
+
+创建逻辑伪代码：
+
+```php
+// AddressService::create()
+public function create(int $userId, array $data): UserAddress
+{
+    $count = $this->addressRepo->countByUser($userId);
+    if ($count >= 20) {
+        throw new AddressLimitExceededException();
+    }
+
+    // 第一条地址自动设为默认
+    $isDefault = $data['is_default'] ?? ($count === 0);
+
+    return DB::transaction(function () use ($userId, $data, $isDefault) {
+        if ($isDefault) {
+            $this->addressRepo->clearDefault($userId);
+        }
+        return $this->addressRepo->create([
+            ...$data,
+            'user_id'    => $userId,
+            'is_default' => $isDefault,
+        ]);
+    });
+}
+```
+
+**（4）修改地址 `PUT /user/addresses/{id}`**
+
+```
+客户端                                   服务端
+  │                                       │
+  │  PUT /user/addresses/42               │
+  │  {name, phone, province, city,        │
+  │   district, address, is_default}      │
+  │──────────────────────────────────────→│
+  │                                       │ 1. 校验字段 + 归属校验
+  │                                       │ 2. 若 is_default: false → true：
+  │                                       │    事务：清除旧默认 + 设置新默认
+  │                                       │ 3. 若 is_default: true → false：
+  │                                       │    拒绝（422 不允许取消唯一默认）
+  │                                       │ 4. UPDATE 地址记录
+  │     200 {脱敏地址}                     │
+  │←──────────────────────────────────────│
+```
+
+默认地址保护规则：
+- 设置新默认：允许，自动取消旧默认
+- 取消当前唯一默认：拒绝，至少保持一个默认地址
+
+**（5）删除地址 `DELETE /user/addresses/{id}`**
+
+```
+客户端                                   服务端
+  │                                       │
+  │  DELETE /user/addresses/42            │
+  │──────────────────────────────────────→│
+  │                                       │ 1. 归属校验
+  │                                       │ 2. 物理删除地址
+  │                                       │ 3. 若删除的是默认地址且还有其他地址：
+  │                                       │    自动将最近更新的地址设为默认
+  │     204 No Content                    │
+  │←──────────────────────────────────────│
+```
+
+删除后自动补位伪代码：
+
+```php
+// AddressService::delete()
+public function delete(int $userId, int $addressId): void
+{
+    $address = $this->addressRepo->findByUserOrFail($userId, $addressId);
+
+    DB::transaction(function () use ($userId, $address) {
+        $this->addressRepo->delete($address->id);
+
+        if ($address->is_default) {
+            $next = $this->addressRepo->latestByUser($userId);
+            $next?->update(['is_default' => true]);
+        }
+    });
+}
+```
+
+**（6）设为默认地址 `PATCH /user/addresses/{id}/default`**
+
+列表页"设为默认"按钮的快捷接口，无需提交其他字段：
+
+```
+客户端                                   服务端
+  │                                       │
+  │  PATCH /user/addresses/42/default     │
+  │──────────────────────────────────────→│
+  │                                       │ 1. 归属校验
+  │                                       │ 2. 事务：清除旧默认 + 设置新默认
+  │     200 {脱敏地址}                     │
+  │←──────────────────────────────────────│
+```
+
+#### 2.11.4 订单地址快照
+
+下单时序列化完整地址存入 `orders.address_snapshot`：
+
+```json
+{
+    "name": "张三丰",
+    "phone": "13812345678",
+    "province": "浙江省",
+    "city": "杭州市",
+    "district": "西湖区",
+    "address": "幸福路88号3单元201",
+    "full_address": "浙江省杭州市西湖区幸福路88号3单元201"
+}
+```
+
+- **存储**：完整数据（不脱敏），保证售后退货、物流发货等内部流程可用
+- **展示**：`OrderResource` 对快照中 name/phone/address 脱敏输出
+- **隔离**：地址修改/删除不影响已有订单快照
+
+#### 2.11.5 客户端省市区数据说明
+
+APP 端使用 uniapp 或 flutter，省市区数据由客户端本地维护：
+
+- **uniapp**：使用 `uni.chooseLocation()` 或 `picker` 组件 mode="multiSelector" 配合本地行政区划 JSON
+- **flutter**：使用 `city_pickers` 等社区包或自定义省市区三级联动
+
+服务端职责边界：
+- **不提供**省市区字典接口（客户端本地数据足够，且变更频率极低）
+- **只校验**省/市/区字段非空
+- **只存储**文本值（不存储行政区划编码，避免编码标准变更导致的维护成本）
+
+> 若后续需要按区域计算运费（运费模板匹配），在 shipping_templates 中同样使用省市区文本匹配即可。
+
 ### 3.1 模块划分
 
 ```
@@ -1794,6 +2004,8 @@ categories ─── products ──┬─ product_skus (1:N)
 | 42203 | 订单状态不允许此操作 |
 | 42204 | 购物车商品已失效 |
 | 42205 | 收货地址不存在 |
+| 42206 | 收货地址数量超限（最多 20 条） |
+| 42207 | 不允许取消唯一默认地址 |
 | 50001 | 支付网关调用失败 |
 | 50002 | 支付回调验签失败 |
 | 50003 | 退款失败 |
@@ -1842,10 +2054,12 @@ GET    /api/v1/user/profile                获取个人信息（脱敏输出）
 PUT    /api/v1/user/profile                修改个人信息（仅 nickname, avatar）
 POST   /api/v1/user/phone/change           更换手机号（需二次验证 + 新手机号验证码）
 POST   /api/v1/user/phone/bind             绑定手机号（第三方登录用户，需二次验证）
-GET    /api/v1/user/addresses              收货地址列表
+GET    /api/v1/user/addresses              收货地址列表（脱敏输出）
+GET    /api/v1/user/addresses/{id}         单条收货地址（编辑用，不脱敏）
 POST   /api/v1/user/addresses              创建收货地址
 PUT    /api/v1/user/addresses/{id}         修改收货地址
 DELETE /api/v1/user/addresses/{id}         删除收货地址
+PATCH  /api/v1/user/addresses/{id}/default 设为默认地址
 
 GET    /api/v1/cart                         购物车列表
 POST   /api/v1/cart                         加入购物车
@@ -1923,6 +2137,7 @@ app/
 ├── Repositories/                    数据访问层（Repository Pattern）
 │   ├── Contracts/                   Repository 接口定义
 │   │   ├── UserRepositoryInterface
+│   │   ├── AddressRepositoryInterface
 │   │   ├── ProductRepositoryInterface
 │   │   ├── OrderRepositoryInterface
 │   │   ├── CartRepositoryInterface
@@ -1933,6 +2148,7 @@ app/
 │   │   ├── UserRepository
 │   │   ├── UserTokenRepository
 │   │   ├── UserSocialAccountRepository
+│   │   ├── AddressRepository          收货地址（含默认地址管理）
 │   │   ├── ProductRepository
 │   │   ├── ProductSkuRepository
 │   │   ├── CategoryRepository
@@ -1958,7 +2174,8 @@ app/
 │   │   ├── VerifyIdentityService    二次身份验证
 │   │   └── SocialAuth/              第三方登录（工厂模式）
 │   ├── User/
-│   │   └── UserProfileService       用户信息维护（资料修改、换手机号）
+│   │   ├── UserProfileService       用户信息维护（资料修改、换手机号）
+│   │   └── AddressService           收货地址 CRUD + 默认地址管理
 │   ├── Product/ProductService
 │   ├── Cart/CartService
 │   ├── Order/
