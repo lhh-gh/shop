@@ -108,9 +108,10 @@ Client → POST /auth/refresh { refresh_token } → Server
 
 **检测时机：** Refresh Token 刷新时
 
-**检测策略：**
-- 对比请求的 IP 和 User-Agent 与 Refresh Token 创建时记录的是否一致
-- 不一致则判定为泄露
+**检测策略（按平台差异化）：**
+- **PC 平台**：IP 或 UA 任一不匹配即触发检测
+- **移动平台（APP/H5/小程序）**：仅当 IP 和 UA 同时变化时才触发（移动网络频繁切换 IP 属正常行为）
+- 检测策略可通过配置调整，支持按平台单独开关
 
 **处理措施：**
 1. 该 Refresh Token 立即失效（删除）
@@ -173,6 +174,15 @@ pending → approved → returning → refunded → completed
     └→ rejected  └→ cancelled
 ```
 
+**状态转换触发条件：**
+- `pending → approved`：管理员审核通过
+- `pending → rejected`：管理员驳回
+- `approved → returning`：用户提交退货快递单号（仅 return_refund 类型）
+- `approved → refunded`：管理员确认仅退款（refund_only 类型直接跳过 returning）
+- `returning → refunded`：管理员确认收到退货后发起退款
+- `refunded → completed`：退款到账确认
+- `approved → cancelled`：用户在退货前取消售后
+
 ## 4. 数据库设计
 
 ### 4.1 用户认证相关（4 张表）
@@ -232,6 +242,8 @@ pending → approved → returning → refunded → completed
 
 索引：INDEX(user_id, platform)
 
+> 注：此表不使用 Eloquent `updated_at`（`const UPDATED_AT = null`），手动管理 `last_active_at`。
+
 #### security_logs 安全日志表
 
 | 字段 | 类型 | 说明 |
@@ -271,6 +283,7 @@ pending → approved → returning → refunded → completed
 |------|------|------|
 | id | BIGINT UNSIGNED PK | 主键 |
 | category_id | BIGINT UNSIGNED FK | 分类ID |
+| shipping_template_id | BIGINT UNSIGNED FK NULL | 运费模板ID（NULL 则使用默认模板） |
 | title | VARCHAR(255) | 商品标题 |
 | subtitle | VARCHAR(255) NULL | 副标题 |
 | main_image | VARCHAR(255) | 主图 |
@@ -298,6 +311,7 @@ pending → approved → returning → refunded → completed
 | price | DECIMAL(10,2) | SKU 价格 |
 | original_price | DECIMAL(10,2) NULL | 原价（划线价） |
 | stock | INT UNSIGNED DEFAULT 0 | 库存 |
+| weight | DECIMAL(8,2) NULL | 重量（kg，用于按重量计算运费） |
 | sku_code | VARCHAR(50) UNIQUE NULL | SKU 编码 |
 | image | VARCHAR(255) NULL | SKU 图片 |
 | sort_order | INT DEFAULT 0 | 排序 |
@@ -317,6 +331,8 @@ pending → approved → returning → refunded → completed
 | sort_order | INT DEFAULT 0 | 排序 |
 
 索引：INDEX(product_id)
+
+> 注：此表不使用 Eloquent 时间戳（`$timestamps = false`）。
 
 ### 4.3 交易相关（9 张表）
 
@@ -361,8 +377,9 @@ pending → approved → returning → refunded → completed
 | user_id | BIGINT UNSIGNED FK | 用户ID |
 | address_snapshot | JSON | 收货地址快照 |
 | total_amount | DECIMAL(10,2) | 商品总额 |
+| discount_amount | DECIMAL(10,2) DEFAULT 0 | 优惠金额（预留，V1默认为0） |
 | shipping_fee | DECIMAL(10,2) DEFAULT 0 | 运费 |
-| pay_amount | DECIMAL(10,2) | 实付金额 |
+| pay_amount | DECIMAL(10,2) | 实付金额（= total_amount - discount_amount + shipping_fee） |
 | status | VARCHAR(20) DEFAULT 'pending' | 订单状态 |
 | payment_method | VARCHAR(20) NULL | 支付方式 |
 | paid_at | TIMESTAMP NULL | 支付时间 |
@@ -376,7 +393,9 @@ pending → approved → returning → refunded → completed
 | updated_at | TIMESTAMP | |
 | deleted_at | TIMESTAMP NULL | 软删除 |
 
-索引：INDEX(user_id, status), INDEX(order_no)
+索引：INDEX(user_id, status), INDEX(order_no) ← 冗余，UNIQUE 已含索引
+
+> 注：order_no 的 UNIQUE 约束已自动创建索引，无需额外 INDEX。实际迁移中只需 UNIQUE 约束。
 
 #### order_items 订单商品表
 
@@ -393,6 +412,8 @@ pending → approved → returning → refunded → completed
 | quantity | INT UNSIGNED | 数量 |
 
 索引：INDEX(order_id)
+
+> 注：此表不使用 Eloquent 时间戳（`$timestamps = false`），随订单一起创建，不会单独更新。
 
 #### payments 支付记录表
 
@@ -422,6 +443,8 @@ pending → approved → returning → refunded → completed
 | code | VARCHAR(20) UNIQUE | 编码 |
 | is_enabled | TINYINT DEFAULT 1 | 是否启用 |
 | sort_order | INT DEFAULT 0 | 排序 |
+
+> 注：此表不使用 Eloquent 时间戳（`$timestamps = false`），数据通过 seeder 初始化。
 
 #### shipping_templates 运费模板表
 
@@ -457,6 +480,7 @@ pending → approved → returning → refunded → completed
 | id | BIGINT UNSIGNED PK | 主键 |
 | after_sale_no | VARCHAR(32) UNIQUE | 售后单号 |
 | order_id | BIGINT UNSIGNED FK | 订单ID |
+| order_item_id | BIGINT UNSIGNED FK NULL | 订单商品ID（NULL 表示整单售后） |
 | user_id | BIGINT UNSIGNED FK | 用户ID |
 | type | VARCHAR(20) | refund_only/return_refund |
 | status | VARCHAR(20) DEFAULT 'pending' | 售后状态 |
@@ -539,21 +563,35 @@ POST   /api/v1/auth/login/sms              手机验证码登录
 POST   /api/v1/auth/login/wechat           微信登录
 POST   /api/v1/auth/login/alipay           支付宝登录
 POST   /api/v1/auth/sms/send              发送短信验证码
+POST   /api/v1/auth/password/reset         重置密码（手机验证码验证）
 GET    /api/v1/products                    商品列表
 GET    /api/v1/products/{id}               商品详情
 GET    /api/v1/categories                  分类列表
 ```
 
-#### 认证接口（需 Token）
+#### Token 刷新接口（无需 JWT，需 Refresh Token）
+
+```
+POST   /api/v1/auth/refresh                刷新 Token（提交 refresh_token）
+```
+
+#### 第三方回调接口（无需认证，需验签）
+
+```
+POST   /api/v1/payments/notify/{gateway}    支付回调（微信/支付宝服务器调用）
+```
+
+#### 认证接口（需 JWT Token）
 
 ```
 POST   /api/v1/auth/logout                 登出
-POST   /api/v1/auth/refresh                刷新 Token
 GET    /api/v1/auth/devices                在线设备列表
 DELETE /api/v1/auth/devices/{id}           踢掉指定设备
+POST   /api/v1/auth/password/change        修改密码
 
 GET    /api/v1/user/profile                获取个人信息
 PUT    /api/v1/user/profile                修改个人信息
+POST   /api/v1/user/phone/bind             绑定手机号（第三方登录用户）
 GET    /api/v1/user/addresses              收货地址列表
 POST   /api/v1/user/addresses              创建收货地址
 PUT    /api/v1/user/addresses/{id}         修改收货地址
@@ -570,20 +608,22 @@ GET    /api/v1/orders/{no}                  订单详情
 POST   /api/v1/orders/{no}/cancel           取消订单
 POST   /api/v1/orders/{no}/confirm          确认收货
 POST   /api/v1/orders/{no}/pay              发起支付
-
-POST   /api/v1/payments/notify/{gateway}    支付回调（微信/支付宝）
+GET    /api/v1/orders/{no}/shipment         查询物流轨迹
 
 POST   /api/v1/after-sales                  申请售后
 GET    /api/v1/after-sales                  售后列表
 GET    /api/v1/after-sales/{no}             售后详情
+POST   /api/v1/after-sales/{no}/tracking    提交退货快递单号
+POST   /api/v1/after-sales/{no}/cancel      取消售后申请
 ```
 
 ### 5.4 中间件栈
 
 ```
-公开接口:   RateLimiter → ForceJsonResponse → PlatformIdentify → Controller
-认证接口:   RateLimiter → ForceJsonResponse → PlatformIdentify → JwtAuthenticate → JwtBlacklist → Controller
-刷新接口:   RateLimiter → ForceJsonResponse → TokenLeakDetection → Controller
+公开接口:     RateLimiter → ForceJsonResponse → PlatformIdentify → Controller
+认证接口:     RateLimiter → ForceJsonResponse → PlatformIdentify → JwtAuthenticate → JwtBlacklist → Controller
+刷新接口:     RateLimiter → ForceJsonResponse → TokenLeakDetection → Controller
+第三方回调:   RateLimiter → ForceJsonResponse → GatewaySignatureVerify → Controller
 ```
 
 ## 6. 代码架构
@@ -616,7 +656,8 @@ app/
 │   │   ├── JwtAuthenticate
 │   │   ├── JwtBlacklist
 │   │   ├── TokenLeakDetection
-│   │   └── PlatformIdentify
+│   │   ├── PlatformIdentify
+│   │   └── GatewaySignatureVerify
 │   ├── Requests/Api/V1/             表单验证
 │   └── Resources/Api/V1/            API 资源转换
 │
@@ -639,7 +680,7 @@ app/
 │   ├── Shipping/ShippingService
 │   └── AfterSale/AfterSaleService
 │
-├── Enums/                           PHP 8.1+ 枚举
+├── Enums/                           PHP 8.2+ 枚举
 │   ├── OrderStatus
 │   ├── PaymentStatus
 │   ├── AfterSaleStatus
@@ -696,7 +737,18 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 - 频率限制：同一手机号 60 秒内只能发 1 次
 - 验证后立即删除，防止重放
 
-### 7.6 定时任务
+### 7.6 订单创建事务
+
+整个下单流程在数据库事务中执行：
+1. 校验购物车商品有效性（商品上架、SKU存在）
+2. 乐观锁扣减库存（失败则回滚）
+3. 创建 Order 记录
+4. 创建 OrderItem 记录（快照商品信息）
+5. 清除已下单的购物车条目
+6. 事务提交
+7. 触发 OrderCreated 事件
+
+### 7.7 定时任务
 
 | 频率 | 任务 | 说明 |
 |------|------|------|
@@ -704,6 +756,17 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 | 每天 | CleanExpiredTokens | 清理过期 Refresh Token |
 | 每天 | AutoConfirmOrder | 自动确认收货（15天） |
 | 每6小时 | QueryShipmentTrace | 批量查询物流轨迹 |
+
+### 7.8 频率限制
+
+| 端点类别 | 限制 | 说明 |
+|---------|------|------|
+| 短信发送 | 1次/60秒/手机号 | 防止短信轰炸 |
+| 登录接口 | 5次/分钟/IP | 防止暴力破解 |
+| Token 刷新 | 10次/分钟/用户 | 正常使用不会触发 |
+| 一般 API | 60次/分钟/用户 | 通用限制 |
+| 商品浏览 | 120次/分钟/IP | 公开接口宽松限制 |
+| 支付回调 | 30次/分钟/IP | 第三方服务器调用 |
 
 ## 8. 异常处理
 
