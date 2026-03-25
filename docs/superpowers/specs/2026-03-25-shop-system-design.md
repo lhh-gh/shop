@@ -52,90 +52,552 @@
 3. **微信登录**（APP 微信 SDK / 小程序原生 / 公众号网页授权）
 4. **支付宝登录**
 
-### 2.4 认证流程
+### 2.4 Token 体系详细设计
 
-#### 登录流程
+#### 2.4.1 Token 结构
 
-```
-Client → POST /auth/login/{method} → Server
-  1. 验证凭据（密码/验证码/第三方 OAuth）
-  2. 识别客户端平台（X-Platform 请求头）
-  3. 删除该用户同平台旧 Refresh Token（同平台互踢）
-  4. 生成 JWT Access Token（2h，含 user_id, platform, jti）
-  5. 生成 Refresh Token（30天，存库，绑定 IP + UA + platform）
-  6. 记录安全日志
-  7. 返回 { access_token, refresh_token, expires_in }
-```
-
-#### 请求认证流程
+**Access Token (JWT) 结构：**
 
 ```
-Client → Bearer {access_token} → Middleware
-  1. JWT 验签 + 检查过期（纯计算，不查库）
-  2. 查 JWT 黑名单缓存（即时踢人检测）
-  3. 正常：可选查库检查用户状态（封禁等）
-  4. 存储异常：跳过查库，仅依赖 JWT 信息，记录告警
+Header:
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+
+Payload:
+{
+  "iss": "shop-api",              // 签发者
+  "sub": 10001,                   // 用户ID (user_id)
+  "jti": "a1b2c3d4e5f6",         // Token唯一标识（用于黑名单）
+  "iat": 1711353600,              // 签发时间
+  "exp": 1711360800,              // 过期时间（签发后2h）
+  "plat": "app",                  // 登录平台
+  "stat": 1                       // 用户状态（1正常 0禁用）
+}
+
+Signature:
+  HMACSHA256(base64(header) + "." + base64(payload), SECRET_KEY)
 ```
 
-#### Token 刷新流程
+**Refresh Token 结构：**
 
 ```
-Client → POST /auth/refresh { refresh_token } → Server
-  1. 查库验证 Refresh Token 存在且未过期
-  2. 校验 IP + User-Agent 是否与创建时一致
-  3. 不一致 → Token 泄露，删除 Token，返回 401，记录安全日志
-  4. 一致 → 签发新 Access Token，可选旋转 Refresh Token
-  5. 返回 { access_token, refresh_token, expires_in }
+原始值: 64位随机字符串（crypto-safe random）
+  示例: "f8a3b7c1d9e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2"
+
+存储值: SHA256(原始值)
+  → 数据库存哈希值，即使数据库泄露攻击者也无法使用
+
+返回给客户端: 原始值
+客户端存储: 原始值（安全存储：Keychain/SharedPreferences/HttpOnly Cookie）
 ```
 
-### 2.5 设备互踢机制
+#### 2.4.2 Token 派发（签发流程）
 
-**同平台互踢：**
-- 新设备登录时，删除该用户同平台所有 Refresh Token
-- 旧设备的 Access Token 仍有效最多 2h
-- 为实现即时踢掉：将旧设备 JWT 的 jti 写入缓存黑名单（TTL=2h）
-- 旧设备下次请求时被 JwtBlacklist 中间件拦截，返回 40104 错误码
-
-**跨平台共存：**
-- 不同平台的 Token 互不影响
-- 用户可同时在 APP、PC、H5、小程序上登录
-
-**主动踢设备：**
-- 用户在安全中心查看所有在线设备
-- 可主动踢掉指定设备（删除 Refresh Token + JWT 加黑名单）
-
-### 2.6 Token 泄露检测
-
-**检测时机：** Refresh Token 刷新时
-
-**检测策略（按平台差异化）：**
-- **PC 平台**：IP 或 UA 任一不匹配即触发检测
-- **移动平台（APP/H5/小程序）**：仅当 IP 和 UA 同时变化时才触发（移动网络频繁切换 IP 属正常行为）
-- 检测策略可通过配置调整，支持按平台单独开关
-
-**处理措施：**
-1. 该 Refresh Token 立即失效（删除）
-2. 记录安全日志（event=token_leak）
-3. 返回 401 + 错误码 40103
-4. 用户下次登录时可提示："您的账号在异常环境被使用"
-
-### 2.7 第三方登录流程
+**时序图 — 密码登录签发 Token：**
 
 ```
-首次登录：
-  1. 客户端获取第三方授权码 (code)
-  2. 服务端用 code 换取 access_token + openid
-  3. 查询 user_social_accounts 无绑定记录
-  4. 创建 User + UserSocialAccount
-  5. 签发双 Token
+┌────────┐          ┌────────────┐        ┌──────────┐      ┌───────┐     ┌───────┐
+│ Client │          │ LoginCtrl  │        │AuthService│      │  MySQL │     │ Redis │
+└───┬────┘          └─────┬──────┘        └────┬─────┘      └───┬───┘     └───┬───┘
+    │                     │                    │                 │             │
+    │ POST /auth/login/password               │                 │             │
+    │ Headers: X-Platform: app                │                 │             │
+    │ Body: {phone, password}                 │                 │             │
+    │────────────────────>│                    │                 │             │
+    │                     │                    │                 │             │
+    │                     │ login(credentials) │                 │             │
+    │                     │───────────────────>│                 │             │
+    │                     │                    │                 │             │
+    │                     │                    │ 1. 查询用户      │             │
+    │                     │                    │ SELECT * FROM users            │
+    │                     │                    │ WHERE phone=?   │             │
+    │                     │                    │────────────────>│             │
+    │                     │                    │     user record │             │
+    │                     │                    │<────────────────│             │
+    │                     │                    │                 │             │
+    │                     │                    │ 2. 验证密码                    │
+    │                     │                    │ Hash::check(password, hash)    │
+    │                     │                    │ → 失败则抛 AuthException(40107)│
+    │                     │                    │                 │             │
+    │                     │                    │ 3. 检查用户状态                │
+    │                     │                    │ → status=0 则抛 AuthException(40105)
+    │                     │                    │                 │             │
+    │                     │                    │ 4. 查同平台旧Token             │
+    │                     │                    │ SELECT id,jti FROM user_tokens │
+    │                     │                    │ WHERE user_id=? AND platform='app'
+    │                     │                    │────────────────>│             │
+    │                     │                    │   old_tokens[]  │             │
+    │                     │                    │<────────────────│             │
+    │                     │                    │                 │             │
+    │                     │                    │ 5. 旧Token的jti加入JWT黑名单   │
+    │                     │                    │ 遍历 old_tokens:              │
+    │                     │                    │ SET jwt_blacklist:{jti} 1     │
+    │                     │                    │ EX 7200 (2h)   │             │
+    │                     │                    │────────────────────────────>  │
+    │                     │                    │                 │       OK    │
+    │                     │                    │  <────────────────────────────│
+    │                     │                    │                 │             │
+    │                     │                    │ 6. 删除同平台旧Refresh Token   │
+    │                     │                    │ DELETE FROM user_tokens        │
+    │                     │                    │ WHERE user_id=? AND platform='app'
+    │                     │                    │────────────────>│             │
+    │                     │                    │            done │             │
+    │                     │                    │<────────────────│             │
+    │                     │                    │                 │             │
+    │                     │                    │ 7. 生成JWT Access Token        │
+    │                     │                    │ payload = {                    │
+    │                     │                    │   sub: user_id,               │
+    │                     │                    │   jti: new_uuid,              │
+    │                     │                    │   plat: "app",                │
+    │                     │                    │   exp: now + 2h               │
+    │                     │                    │ }                              │
+    │                     │                    │ access_token = JWT.sign(payload, SECRET)
+    │                     │                    │                 │             │
+    │                     │                    │ 8. 生成Refresh Token           │
+    │                     │                    │ raw_token = random(64)         │
+    │                     │                    │ INSERT INTO user_tokens {      │
+    │                     │                    │   user_id, platform: "app",   │
+    │                     │                    │   token: SHA256(raw_token),   │
+    │                     │                    │   client_ip, user_agent,      │
+    │                     │                    │   device_name, expires_at: now+30d
+    │                     │                    │ }               │             │
+    │                     │                    │────────────────>│             │
+    │                     │                    │         inserted│             │
+    │                     │                    │<────────────────│             │
+    │                     │                    │                 │             │
+    │                     │                    │ 9. 记录安全日志               │
+    │                     │                    │ INSERT INTO security_logs      │
+    │                     │                    │ {user_id, event:"login", ...} │
+    │                     │                    │────────────────>│             │
+    │                     │                    │                 │             │
+    │                     │ {access_token, refresh_token, expires_in: 7200}    │
+    │                     │<───────────────────│                 │             │
+    │                     │                    │                 │             │
+    │  200 OK             │                    │                 │             │
+    │  {code:0, data: {access_token, refresh_token, expires_in}}│             │
+    │<────────────────────│                    │                 │             │
+```
 
-再次登录：
-  1. 同上获取 openid
-  2. 查询 user_social_accounts 找到绑定的 user_id
-  3. 直接签发双 Token
+**时序图 — 微信登录签发 Token：**
 
-绑定手机号：
-  第三方登录后若未绑定手机号，引导用户绑定
+```
+┌────────┐     ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌───────┐
+│ Client │     │LoginCtrl │     │ AuthService│     │SocialAuthMgr │     │ MySQL │
+└───┬────┘     └────┬─────┘     └─────┬──────┘     └──────┬───────┘     └───┬───┘
+    │               │                 │                    │                 │
+    │ 1. 客户端先通过微信SDK获取授权码 code                                  │
+    │               │                 │                    │                 │
+    │ POST /auth/login/wechat         │                    │                 │
+    │ Headers: X-Platform: app        │                    │                 │
+    │ Body: {code: "wx_auth_code"}    │                    │                 │
+    │──────────────>│                 │                    │                 │
+    │               │                 │                    │                 │
+    │               │ loginByWechat() │                    │                 │
+    │               │────────────────>│                    │                 │
+    │               │                 │                    │                 │
+    │               │                 │ getWechatUser(code)│                 │
+    │               │                 │───────────────────>│                 │
+    │               │                 │                    │                 │
+    │               │                 │                    │ 2. code换取access_token
+    │               │                 │                    │ POST https://api.weixin.qq.com
+    │               │                 │                    │   /sns/oauth2/access_token
+    │               │                 │                    │   ?code=wx_auth_code
+    │               │                 │                    │                 │
+    │               │                 │                    │ 3. 获取用户信息 │
+    │               │                 │                    │ GET /sns/userinfo│
+    │               │                 │                    │   ?access_token=...&openid=...
+    │               │                 │                    │                 │
+    │               │                 │  {openid, unionid, nickname, avatar}│
+    │               │                 │<───────────────────│                 │
+    │               │                 │                    │                 │
+    │               │                 │ 4. 查绑定关系                       │
+    │               │                 │ SELECT * FROM user_social_accounts   │
+    │               │                 │ WHERE platform='wechat_app'          │
+    │               │                 │   AND platform_id={openid}           │
+    │               │                 │────────────────────────────────────> │
+    │               │                 │                                      │
+    │               │                 │ ┌─── 未找到（首次登录）──────────────┐│
+    │               │                 │ │ 5a. 创建用户                      ││
+    │               │                 │ │ INSERT INTO users {nickname,avatar}││
+    │               │                 │ │ 5b. 创建绑定关系                  ││
+    │               │                 │ │ INSERT INTO user_social_accounts   ││
+    │               │                 │ │ {user_id, platform, platform_id,  ││
+    │               │                 │ │  union_id, nickname, avatar}      ││
+    │               │                 │ └───────────────────────────────────┘│
+    │               │                 │                                      │
+    │               │                 │ ┌─── 已找到（再次登录）─────────────┐│
+    │               │                 │ │ 5c. 获取关联的 user_id           ││
+    │               │                 │ └───────────────────────────────────┘│
+    │               │                 │                    │                 │
+    │               │                 │ 6. 后续流程与密码登录相同（步骤4-9）│
+    │               │                 │    同平台互踢 → 签发双Token → 安全日志
+    │               │                 │                    │                 │
+    │  200 OK {access_token, refresh_token, expires_in}    │                 │
+    │<──────────────│                 │                    │                 │
+```
+
+#### 2.4.3 Token 存储方案
+
+**服务端存储：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        服务端 Token 存储                        │
+├─────────────────┬───────────────────────────────────────────────┤
+│                 │                                               │
+│  MySQL          │  user_tokens 表                               │
+│  (持久化存储)    │  ├── Refresh Token (SHA256哈希)               │
+│                 │  ├── 用户ID + 平台 + 设备信息                  │
+│                 │  ├── 创建时 IP + User-Agent (泄露检测基准)     │
+│                 │  ├── 过期时间 (30天)                           │
+│                 │  └── 最后活跃时间                              │
+│                 │                                               │
+├─────────────────┼───────────────────────────────────────────────┤
+│                 │                                               │
+│  Redis          │  1. JWT 黑名单                                │
+│  (高速缓存)     │     Key:  jwt_blacklist:{jti}                 │
+│                 │     Value: 1                                  │
+│                 │     TTL:   7200s (2h，与Access Token同寿命)    │
+│                 │                                               │
+│                 │  2. 短信验证码                                 │
+│                 │     Key:  sms_code:{phone}                    │
+│                 │     Value: {code}                              │
+│                 │     TTL:   300s (5分钟)                        │
+│                 │                                               │
+│                 │  3. 二次验证 Token                             │
+│                 │     Key:  verify_token:{token}                │
+│                 │     Value: {user_id}                           │
+│                 │     TTL:   300s (5分钟)                        │
+│                 │                                               │
+│                 │  4. 登录失败计数                               │
+│                 │     Key:  login_fail:{phone}                  │
+│                 │     Value: {count}                             │
+│                 │     TTL:   900s (15分钟)                       │
+│                 │                                               │
+├─────────────────┼───────────────────────────────────────────────┤
+│                 │                                               │
+│  JWT 自身       │  Access Token 不存储在服务端                   │
+│  (无状态)       │  ├── 签名保证不可伪造                          │
+│                 │  ├── payload 自包含用户信息                    │
+│                 │  └── 过期时间自包含，验签时自动检查             │
+│                 │                                               │
+└─────────────────┴───────────────────────────────────────────────┘
+```
+
+**客户端存储（按平台）：**
+
+```
+┌──────────────┬─────────────────────────┬────────────────────────┐
+│ 平台          │ Access Token 存储       │ Refresh Token 存储     │
+├──────────────┼─────────────────────────┼────────────────────────┤
+│ APP (iOS)    │ 内存 (变量)              │ Keychain (加密)        │
+│ APP (Android)│ 内存 (变量)              │ EncryptedSharedPrefs   │
+│ 小程序       │ 内存 (变量/globalData)   │ wx.setStorageSync      │
+│ H5           │ 内存 (变量/Vuex/Pinia)   │ HttpOnly Secure Cookie │
+│ PC Web       │ 内存 (变量/Vuex/Pinia)   │ HttpOnly Secure Cookie │
+├──────────────┴─────────────────────────┴────────────────────────┤
+│ 原则：Access Token 仅存内存，页面刷新/App重启后丢失，           │
+│       靠 Refresh Token 重新获取。Refresh Token 持久化安全存储。  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.4.4 Token 认证（请求验证流程）
+
+**时序图 — 正常 API 请求认证：**
+
+```
+┌────────┐     ┌────────────┐    ┌─────────────┐   ┌────────────┐   ┌───────┐  ┌──────────┐
+│ Client │     │JwtAuth MW  │    │JwtBlacklist │   │OptionalDB  │   │ Redis │  │Controller│
+└───┬────┘     └─────┬──────┘    └──────┬──────┘   └─────┬──────┘   └───┬───┘  └────┬─────┘
+    │                │                  │                 │               │           │
+    │ GET /api/v1/orders               │                 │               │           │
+    │ Authorization: Bearer {jwt}       │                 │               │           │
+    │───────────────>│                  │                 │               │           │
+    │                │                  │                 │               │           │
+    │                │ 1. 解析JWT       │                 │               │           │
+    │                │ 从Header提取token │                 │               │           │
+    │                │                  │                 │               │           │
+    │                │ 2. 验证签名       │                 │               │           │
+    │                │ HMAC-SHA256验签   │                 │               │           │
+    │                │ → 签名无效: 401  │                 │               │           │
+    │                │                  │                 │               │           │
+    │                │ 3. 检查过期       │                 │               │           │
+    │                │ exp > now ?      │                 │               │           │
+    │                │ → 过期: 401      │                 │               │           │
+    │                │ (code: 40101)    │                 │               │           │
+    │                │                  │                 │               │           │
+    │                │ 4. 提取payload   │                 │               │           │
+    │                │ {sub,jti,plat}   │                 │               │           │
+    │                │ 注入Request      │                 │               │           │
+    │                │                  │                 │               │           │
+    │                │ next(request) ──>│                 │               │           │
+    │                │                  │                 │               │           │
+    │                │                  │ 5. 查JWT黑名单  │               │           │
+    │                │                  │ GET jwt_blacklist:{jti}         │           │
+    │                │                  │───────────────────────────────> │           │
+    │                │                  │                 │         null  │           │
+    │                │                  │  <──────────────────────────────│           │
+    │                │                  │ → 不在黑名单，放行              │           │
+    │                │                  │ → 在黑名单: 401 (code: 40104)  │           │
+    │                │                  │                 │               │           │
+    │                │                  │ next(request) ─>│               │           │
+    │                │                  │                 │               │           │
+    │                │                  │                 │ 6. [可选]查库  │           │
+    │                │                  │                 │ 检查用户状态   │           │
+    │                │                  │                 │ SELECT status  │           │
+    │                │                  │                 │ FROM users     │           │
+    │                │                  │                 │ WHERE id=?     │           │
+    │                │                  │                 │               │           │
+    │                │                  │                 │ → status=0:   │           │
+    │                │                  │                 │   401(40105)  │           │
+    │                │                  │                 │               │           │
+    │                │                  │                 │ → DB异常:     │           │
+    │                │                  │                 │   跳过，记录   │           │
+    │                │                  │                 │   告警日志，   │           │
+    │                │                  │                 │   信任JWT数据  │           │
+    │                │                  │                 │               │           │
+    │                │                  │                 │ next(request)────────────>│
+    │                │                  │                 │               │           │
+    │                │                  │                 │               │  处理业务  │
+    │                │                  │                 │               │           │
+    │  200 OK {code: 0, data: {...}}   │                 │               │           │
+    │<──────────────────────────────────────────────────────────────────────────────│
+```
+
+**认证决策流程图：**
+
+```
+                    ┌──────────────────┐
+                    │  收到API请求      │
+                    │  Authorization:  │
+                    │  Bearer {jwt}    │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  JWT 验签         │
+                    │  (纯计算,不查库)  │
+                    └────────┬─────────┘
+                             │
+                   ┌─────────▼──────────┐
+                   │  签名有效?          │
+                   └─────────┬──────────┘
+                        NO / │ \ YES
+                       ┌─────┘  └─────┐
+                       ▼              ▼
+                 ┌───────────┐  ┌───────────┐
+                 │ 401 未认证│  │ Token过期? │
+                 └───────────┘  └─────┬─────┘
+                                 YES / │ \ NO
+                                ┌─────┘  └──────┐
+                                ▼               ▼
+                         ┌───────────┐   ┌─────────────┐
+                         │401 (40101)│   │查Redis黑名单 │
+                         │Token过期  │   │jwt_blacklist │
+                         │→客户端应  │   │  :{jti}      │
+                         │ 刷新Token │   └──────┬──────┘
+                         └───────────┘    HIT / │ \ MISS
+                                        ┌─────┘  └──────┐
+                                        ▼               ▼
+                                 ┌───────────┐   ┌───────────────┐
+                                 │401 (40104)│   │[可选] 查库     │
+                                 │设备被踢   │   │检查用户状态    │
+                                 └───────────┘   └───────┬───────┘
+                                                    OK / │ \ 禁用
+                                                   ┌────┘  └────┐
+                                                   ▼            ▼
+                                             ┌──────────┐ ┌──────────┐
+                                             │ 放行     │ │401(40105)│
+                                             │→Controller│ │账号禁用  │
+                                             └──────────┘ └──────────┘
+```
+
+#### 2.4.5 Token 刷新
+
+**时序图 — Token 刷新（含泄露检测）：**
+
+```
+┌────────┐       ┌────────────┐      ┌──────────┐      ┌───────┐     ┌───────┐
+│ Client │       │ TokenCtrl  │      │AuthService│      │ MySQL │     │ Redis │
+└───┬────┘       └─────┬──────┘      └────┬─────┘      └───┬───┘     └───┬───┘
+    │                  │                   │                │             │
+    │ Access Token 过期 (前端收到401 code:40101)             │             │
+    │                  │                   │                │             │
+    │ POST /auth/refresh                   │                │             │
+    │ Body: {refresh_token: "f8a3b7c1..."}│                │             │
+    │─────────────────>│                   │                │             │
+    │                  │                   │                │             │
+    │                  │ refresh(token)    │                │             │
+    │                  │──────────────────>│                │             │
+    │                  │                   │                │             │
+    │                  │                   │ 1. 计算哈希查库│             │
+    │                  │                   │ hash = SHA256(raw_token)     │
+    │                  │                   │ SELECT * FROM user_tokens    │
+    │                  │                   │ WHERE token = {hash}         │
+    │                  │                   │───────────────>│             │
+    │                  │                   │  token_record  │             │
+    │                  │                   │<───────────────│             │
+    │                  │                   │                │             │
+    │                  │                   │ → 未找到: 401 (40102)        │
+    │                  │                   │ → 已过期: 401 (40102)        │
+    │                  │                   │                │             │
+    │                  │                   │ 2. 泄露检测                  │
+    │                  │                   │ ┌────────────────────────┐   │
+    │                  │                   │ │ PC平台:                │   │
+    │                  │                   │ │  IP不匹配 OR UA不匹配   │   │
+    │                  │                   │ │  → 判定泄露             │   │
+    │                  │                   │ │                        │   │
+    │                  │                   │ │ 移动平台(APP/H5/小程序):│   │
+    │                  │                   │ │  IP不匹配 AND UA不匹配  │   │
+    │                  │                   │ │  → 判定泄露             │   │
+    │                  │                   │ │  仅IP变化 → 正常(移动网络)│  │
+    │                  │                   │ └────────────────────────┘   │
+    │                  │                   │                │             │
+    │                  │                   │ ┌─ 泄露检测触发 ──────────┐  │
+    │                  │                   │ │ DELETE FROM user_tokens  │  │
+    │                  │                   │ │ WHERE id = ?             │  │
+    │                  │                   │ │                          │  │
+    │                  │                   │ │ INSERT INTO security_logs│  │
+    │                  │                   │ │ {event: "token_leak"}    │  │
+    │                  │                   │ │                          │  │
+    │                  │                   │ │ 返回 401 (40103)        │  │
+    │                  │                   │ └──────────────────────────┘  │
+    │                  │                   │                │             │
+    │                  │                   │ 3. 泄露检测通过，签发新Token │
+    │                  │                   │                │             │
+    │                  │                   │ 3a. 生成新 Access Token      │
+    │                  │                   │ JWT.sign({sub, jti:new, plat, exp:+2h})
+    │                  │                   │                │             │
+    │                  │                   │ 3b. 旋转 Refresh Token       │
+    │                  │                   │ new_raw = random(64)         │
+    │                  │                   │ UPDATE user_tokens SET       │
+    │                  │                   │   token=SHA256(new_raw),     │
+    │                  │                   │   client_ip=当前IP,          │
+    │                  │                   │   user_agent=当前UA,         │
+    │                  │                   │   last_active_at=now         │
+    │                  │                   │ WHERE id = ?   │             │
+    │                  │                   │───────────────>│             │
+    │                  │                   │                │             │
+    │                  │ {access_token(新), refresh_token(新), expires_in}│
+    │                  │<──────────────────│                │             │
+    │                  │                   │                │             │
+    │  200 OK          │                   │                │             │
+    │  {access_token, refresh_token, expires_in: 7200}     │             │
+    │<─────────────────│                   │                │             │
+    │                  │                   │                │             │
+    │ 客户端更新存储的双Token               │                │             │
+```
+
+**客户端 Token 刷新策略：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  客户端 Token 刷新策略                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  策略一：被动刷新（推荐）                                        │
+│  ├── API 请求收到 401 + code:40101 (Token过期)                  │
+│  ├── 自动用 Refresh Token 调用 /auth/refresh                    │
+│  ├── 获取新双Token，重试原始请求                                 │
+│  └── 刷新失败 → 跳转登录页                                      │
+│                                                                 │
+│  策略二：主动刷新（可选增强）                                     │
+│  ├── 客户端记录 Access Token 过期时间                            │
+│  ├── 在过期前 5 分钟主动刷新                                     │
+│  └── 避免用户感知到 Token 过期的瞬间                             │
+│                                                                 │
+│  并发刷新防护：                                                  │
+│  ├── 多个并发请求同时发现 Token 过期                             │
+│  ├── 客户端用 Promise 锁保证只发一次刷新请求                     │
+│  └── 其他请求等待刷新完成后用新 Token 重试                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.4.6 Token 吊销（设备互踢）
+
+**时序图 — 新设备登录踢旧设备：**
+
+```
+时间线 ──────────────────────────────────────────────────────────────>
+
+T0: 张三用 iPhone 登录 APP
+    └─ user_tokens: {id:1, user_id:张三, platform:app, token:hash_A}
+    └─ iPhone 持有: access_token_A (jti: jti_A) + refresh_token_A
+
+T1: 张三用 Android 登录 APP （触发同平台互踢）
+    │
+    ├─ Step1: 查出张三 platform=app 的旧 token → 找到 id:1
+    │
+    ├─ Step2: 将 jti_A 写入 Redis 黑名单
+    │   └─ SET jwt_blacklist:jti_A 1 EX 7200
+    │
+    ├─ Step3: 删除旧 Refresh Token
+    │   └─ DELETE FROM user_tokens WHERE id=1
+    │
+    ├─ Step4: 为 Android 签发新 Token
+    │   └─ user_tokens: {id:2, user_id:张三, platform:app, token:hash_B}
+    │   └─ Android 持有: access_token_B (jti: jti_B) + refresh_token_B
+    │
+    └─ 此时张三的 Token 状态:
+        APP(Android): access_token_B ✓ + refresh_token_B ✓  ← 正常
+        APP(iPhone):  access_token_A ✗ + refresh_token_A ✗  ← 已失效
+        小程序:       access_token_C ✓ + refresh_token_C ✓  ← 不受影响
+        PC:          access_token_D ✓ + refresh_token_D ✓  ← 不受影响
+
+T2: iPhone 发起 API 请求 (携带 access_token_A)
+    │
+    ├─ JwtAuth 中间件: JWT 验签通过，未过期
+    ├─ JwtBlacklist 中间件: 查 Redis → jwt_blacklist:jti_A 存在!
+    └─ 返回 401 {code: 40104, message: "您的账号已在另一台设备登录"}
+
+T3: iPhone 尝试刷新 Token (携带 refresh_token_A)
+    │
+    ├─ 计算 SHA256(refresh_token_A) 查库
+    ├─ 未找到记录（已在T1被删除）
+    └─ 返回 401 {code: 40102, message: "登录已过期，请重新登录"}
+
+T4: iPhone 跳转登录页
+```
+
+#### 2.4.7 Token 完整生命周期
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Token 完整生命周期                                │
+│                                                                     │
+│  ┌──────────┐                                                       │
+│  │  签发     │  用户登录成功                                         │
+│  │ (Birth)  │  → JWT Access Token (2h) + Refresh Token (30天)      │
+│  └────┬─────┘                                                       │
+│       │                                                             │
+│       ▼                                                             │
+│  ┌──────────┐                                                       │
+│  │  使用     │  每次 API 请求携带 Access Token                       │
+│  │ (Active) │  中间件验签 → 黑名单检查 → [可选]查库 → 放行           │
+│  └────┬─────┘                                                       │
+│       │                                                             │
+│       ▼  Access Token 过期 (2h)                                     │
+│  ┌──────────┐                                                       │
+│  │  刷新     │  用 Refresh Token 获取新的双 Token                    │
+│  │(Refresh) │  泄露检测 → 旋转 Refresh Token → 签发新 Access Token  │
+│  └────┬─────┘                                                       │
+│       │   ↑                                                         │
+│       │   └──── 循环：每2h刷新一次，Refresh Token 30天内有效         │
+│       │                                                             │
+│       ▼  最终失效                                                    │
+│  ┌──────────┐                                                       │
+│  │  死亡     │  以下任一情况触发:                                     │
+│  │ (Death)  │  ├── Refresh Token 过期 (30天到期)                    │
+│  └──────────┘  ├── 用户主动登出 (DELETE Refresh Token)              │
+│                ├── 同平台新设备登录 (互踢)                           │
+│                ├── Token 泄露检测触发                                │
+│                ├── 用户主动踢设备                                    │
+│                ├── 管理员封禁账号                                    │
+│                └── 用户修改密码 (可选：所有Token失效)                 │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.8 密码策略
