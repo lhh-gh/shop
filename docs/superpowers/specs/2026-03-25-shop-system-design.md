@@ -9,7 +9,7 @@
 - **框架**: Laravel 12 (PHP 8.2+)
 - **认证**: JWT Access Token + Database Refresh Token (php-open-source-saver/jwt-auth)
 - **数据库**: MySQL
-- **缓存**: Laravel Cache (Database driver，可切换 Redis)
+- **缓存**: Redis（Repository 缓存层 + JWT 黑名单 + 短信验证码 + 频率限制）
 - **队列**: Database driver (可切换 Redis)
 
 ### 客户端平台
@@ -670,7 +670,7 @@ app/
 │   │   ├── CartRepositoryInterface
 │   │   ├── PaymentRepositoryInterface
 │   │   └── AfterSaleRepositoryInterface
-│   ├── Eloquent/                    Eloquent 实现
+│   ├── Eloquent/                    MySQL 实现（Eloquent ORM）
 │   │   ├── BaseRepository           基础 Repository（通用 CRUD）
 │   │   ├── UserRepository
 │   │   ├── UserTokenRepository
@@ -683,7 +683,12 @@ app/
 │   │   ├── PaymentRepository
 │   │   ├── ShipmentRepository
 │   │   └── AfterSaleRepository
-│   └── RepositoryServiceProvider    接口→实现绑定
+│   ├── Cache/                       Redis 缓存装饰器
+│   │   ├── CachingProductRepository     商品缓存（高频读取）
+│   │   ├── CachingCategoryRepository    分类缓存（几乎不变）
+│   │   ├── CachingProductSkuRepository  SKU 缓存（含库存）
+│   │   └── CachingUserRepository        用户基础信息缓存
+│   └── RepositoryServiceProvider    接口→实现绑定（装饰器组装）
 │
 ├── Services/                        业务逻辑层（不直接操作 Model）
 │   ├── Auth/
@@ -741,10 +746,14 @@ Service（业务逻辑层）
   └── Service 之间可以互相调用
 
 Repository（数据访问层）
-  ├── 封装所有 Eloquent 查询逻辑
+  ├── 封装所有数据访问逻辑，支持 MySQL（Eloquent）和 Redis 双数据源
   ├── 通过接口（Contract）定义，实现依赖倒置
+  ├── Eloquent/ — MySQL 实现，处理所有数据库读写
+  ├── Cache/ — Redis 缓存装饰器，包装 Eloquent 实现
+  │   ├── 读操作：先查 Redis，命中则返回；未命中查 MySQL 后回填 Redis
+  │   ├── 写操作：先写 MySQL，成功后删除/更新 Redis 缓存
+  │   └── 仅对高频读取的 Repository 加缓存，非所有 Repository 都需要
   ├── 提供通用 CRUD（BaseRepository）+ 业务专用查询方法
-  ├── 未来可替换为其他 ORM 或数据源而不影响 Service 层
   └── 复杂查询（如商品搜索/筛选）集中在 Repository 中
 
 Model（数据模型层）
@@ -757,25 +766,75 @@ Model（数据模型层）
 #### Repository 接口示例
 
 ```php
-// app/Repositories/Contracts/OrderRepositoryInterface.php
-interface OrderRepositoryInterface
+// app/Repositories/Contracts/ProductRepositoryInterface.php
+interface ProductRepositoryInterface
 {
-    public function findByOrderNo(string $orderNo): ?Order;
-    public function getByUser(int $userId, ?string $status, int $perPage): LengthAwarePaginator;
-    public function createWithItems(array $orderData, array $items): Order;
-    public function updateStatus(int $orderId, OrderStatus $status): bool;
-    public function getExpiredPendingOrders(int $minutes): Collection;
+    public function findById(int $id): ?Product;
+    public function getListByCategory(?int $categoryId, int $perPage): LengthAwarePaginator;
+    public function search(string $keyword, array $filters, int $perPage): LengthAwarePaginator;
 }
 ```
 
-#### 依赖注入绑定
+#### 缓存装饰器示例
+
+```php
+// app/Repositories/Cache/CachingProductRepository.php
+class CachingProductRepository implements ProductRepositoryInterface
+{
+    public function __construct(
+        private ProductRepository $eloquent,  // 被装饰的 Eloquent 实现
+        private CacheManager $cache,
+    ) {}
+
+    public function findById(int $id): ?Product
+    {
+        return $this->cache->remember(
+            "product:{$id}",
+            ttl: 3600, // 1小时
+            callback: fn () => $this->eloquent->findById($id)
+        );
+    }
+
+    // 列表/搜索类查询不走缓存，直接透传到 Eloquent
+    public function getListByCategory(?int $categoryId, int $perPage): LengthAwarePaginator
+    {
+        return $this->eloquent->getListByCategory($categoryId, $perPage);
+    }
+}
+```
+
+#### 缓存策略
+
+| Repository | 是否缓存 | 缓存策略 | TTL |
+|-----------|---------|---------|-----|
+| ProductRepository | 是 | 商品详情按 ID 缓存，列表不缓存 | 1h |
+| CategoryRepository | 是 | 分类树整体缓存 | 24h |
+| ProductSkuRepository | 是 | SKU 详情缓存（不含库存），库存单独缓存 | 30min |
+| UserRepository | 是 | 用户基础信息缓存 | 1h |
+| OrderRepository | 否 | 订单数据实时性要求高 | - |
+| CartRepository | 否 | 购物车频繁变动，缓存收益低 | - |
+| PaymentRepository | 否 | 支付数据必须实时 | - |
+| AfterSaleRepository | 否 | 售后数据实时性要求高 | - |
+
+**缓存失效策略：** 写操作后主动删除对应缓存 key，下次读取时自动回填。
+
+#### 依赖注入绑定（装饰器组装）
 
 ```php
 // app/Repositories/RepositoryServiceProvider.php
-// 在 ServiceProvider 中将接口绑定到 Eloquent 实现
+
+// 需要缓存的 Repository：接口 → 缓存装饰器（内部包装 Eloquent 实现）
+$this->app->bind(ProductRepositoryInterface::class, function ($app) {
+    return new CachingProductRepository(
+        eloquent: $app->make(ProductRepository::class),
+        cache: $app->make(CacheManager::class),
+    );
+});
+
+// 不需要缓存的 Repository：接口 → 直接绑定 Eloquent 实现
 $this->app->bind(OrderRepositoryInterface::class, OrderRepository::class);
-$this->app->bind(ProductRepositoryInterface::class, ProductRepository::class);
-// ...
+$this->app->bind(CartRepositoryInterface::class, CartRepository::class);
+$this->app->bind(PaymentRepositoryInterface::class, PaymentRepository::class);
 ```
 
 ### 6.3 架构模式
@@ -784,6 +843,7 @@ $this->app->bind(ProductRepositoryInterface::class, ProductRepository::class);
 |------|----------|
 | 四层架构 | Controller → Service → Repository → Model |
 | Repository Pattern | 数据访问抽象，接口与实现分离 |
+| 装饰器模式 | Redis 缓存层包装 Eloquent 实现，对 Service 透明 |
 | 工厂模式 | 第三方登录 SocialAuthManager |
 | 策略模式 | 支付网关 PaymentGatewayInterface |
 | 事件驱动 | 登录日志、订单状态变更通知、库存扣减 |
