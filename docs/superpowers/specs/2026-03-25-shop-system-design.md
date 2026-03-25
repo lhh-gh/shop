@@ -1589,8 +1589,7 @@ APP 端使用 uniapp 或 flutter，省市区数据由客户端本地维护：
 ├── 用户认证模块 (Auth)        → 注册/登录/Token/设备/安全
 ├── 商品模块 (Product)         → 分类/SPU/SKU/属性/搜索
 ├── 购物车模块 (Cart)          → 加购/调整/选中/删除
-├── 订单模块 (Order)           → 下单/状态机/列表/详情
-├── 支付模块 (Payment)         → 微信支付/支付宝/回调/退款
+├── 订单模块 (Order)           → 下单/支付/状态机/列表/详情/退款
 ├── 物流模块 (Shipping)        → 物流公司/运费模板/轨迹查询
 └── 售后模块 (AfterSale)       → 退款/退货/售后状态机
 ```
@@ -1624,6 +1623,323 @@ pending → approved → returning → refunded → completed
 - `returning → refunded`：管理员确认收到退货后发起退款
 - `refunded → completed`：退款到账确认
 - `approved → cancelled`：用户在退货前取消售后
+
+### 3.4 支付系统详细设计（模板方法 + 策略模式）
+
+支付是订单生命周期的一部分，归属于订单模块。核心挑战：2 种支付渠道（微信/支付宝） × 4 种客户端场景（APP/小程序/H5/PC）= 8 种组合，每种的参数构建、API 调用、回调验签、客户端响应格式都不同。
+
+#### 3.4.1 支付渠道 × 场景矩阵
+
+| 渠道＼场景 | APP | 小程序 | H5 | PC |
+|-----------|-----|--------|-----|-----|
+| **微信** | APP支付 | JSAPI小程序支付 | H5支付 | Native扫码支付 |
+| **支付宝** | APP支付 | 小程序支付 | WAP支付 | 电脑网站支付 |
+
+每种组合对应一个 driver 名称，由 `{gateway}_{scene}` 拼接：
+
+| driver 名称 | 类名 | 客户端返回 |
+|-------------|------|-----------|
+| `wechat_app` | WechatAppPayment | APP SDK 调起参数（prepay_id + 签名） |
+| `wechat_mini` | WechatMiniPayment | 小程序 wx.requestPayment 参数 |
+| `wechat_h5` | WechatH5Payment | 微信 H5 跳转 URL |
+| `wechat_pc` | WechatNativePayment | code_url（前端生成二维码） |
+| `alipay_app` | AlipayAppPayment | APP SDK 签名串（orderStr） |
+| `alipay_mini` | AlipayMiniPayment | tradeNO（小程序 tradePay 参数） |
+| `alipay_h5` | AlipayWapPayment | WAP 跳转 URL |
+| `alipay_pc` | AlipayPagePayment | 自提交表单 HTML 或跳转 URL |
+
+#### 3.4.2 模板方法模式 — 支付流程骨架
+
+`AbstractPaymentGateway` 抽象基类定义三个模板方法，每个方法内按固定步骤调用通用方法（final）和抽象方法：
+
+```
+AbstractPaymentGateway
+│
+├── pay($order): PayResult  ──── 模板方法 ─────────────
+│   ├── validateOrder()              通用（final）：校验订单状态为 pending
+│   ├── createPaymentRecord()        通用（final）：写入 payments 表，状态 pending
+│   ├── buildPayParams()             抽象：各渠道+场景构建不同的请求参数
+│   ├── callGatewayApi()             抽象：调用第三方统一下单/交易创建 API
+│   └── formatClientResponse()       抽象：将 API 返回转为客户端需要的格式
+│
+├── handleCallback($request): string ──── 模板方法 ──
+│   ├── verifySignature()            抽象：微信v3验签 / 支付宝RSA2验签
+│   ├── parseCallbackData()          抽象：微信AES解密 / 支付宝表单解析
+│   ├── processPaymentResult()       通用（final）：事务更新 payment+order 状态
+│   └── buildCallbackResponse()      抽象：微信 JSON / 支付宝 "success"
+│
+└── refund($payment, $amount): RefundResult ──── 模板方法 ──
+    ├── validateRefundable()         通用（final）：校验支付状态、退款金额
+    ├── buildRefundParams()          抽象：各渠道退款参数格式
+    ├── callRefundApi()              抽象：调用退款 API
+    └── saveRefundRecord()           通用（final）：更新 payment 退款字段
+```
+
+#### 3.4.3 类继承结构
+
+三层继承：**接口** → **抽象基类**（模板方法+通用逻辑） → **渠道通用层**（验签/解密/退款） → **场景实现**（参数差异）
+
+```
+PaymentGatewayInterface（接口契约）
+│   pay(Order $order): PayResult
+│   handleCallback(Request $request): string
+│   refund(Payment $payment, float $amount): RefundResult
+│
+└── AbstractPaymentGateway（抽象基类 — 模板方法 + 通用逻辑）
+    │   # final 通用方法
+    │   validateOrder()
+    │   createPaymentRecord()
+    │   processPaymentResult()
+    │   validateRefundable()
+    │   saveRefundRecord()
+    │
+    ├── AbstractWechatPayment（微信渠道通用层）
+    │   │   verifySignature()         微信支付 v3 AEAD_AES_256_GCM 验签
+    │   │   parseCallbackData()       AES-256-GCM 解密回调报文
+    │   │   buildCallbackResponse()   return json_encode(["code" => "SUCCESS"])
+    │   │   buildRefundParams()       微信退款参数（out_refund_no, amount 等）
+    │   │   callRefundApi()           POST /v3/refund/domestic/refunds
+    │   │
+    │   ├── WechatAppPayment          buildPayParams: appid+prepay_id+签名
+    │   │                             callGatewayApi: POST /v3/pay/transactions/app
+    │   │                             formatClientResponse: {prepay_id, sign, timestamp, ...}
+    │   │
+    │   ├── WechatMiniPayment         callGatewayApi: POST /v3/pay/transactions/jsapi
+    │   │                             formatClientResponse: {timeStamp, nonceStr, package, ...}
+    │   │
+    │   ├── WechatH5Payment           callGatewayApi: POST /v3/pay/transactions/h5
+    │   │                             formatClientResponse: {h5_url: "https://wx.tenpay.com/..."}
+    │   │
+    │   └── WechatNativePayment       callGatewayApi: POST /v3/pay/transactions/native
+    │                                 formatClientResponse: {code_url: "weixin://wxpay/..."}
+    │
+    └── AbstractAlipayPayment（支付宝渠道通用层）
+        │   verifySignature()         RSA2 (SHA256WithRSA) 公钥验签
+        │   parseCallbackData()       解析 POST 表单参数
+        │   buildCallbackResponse()   return "success"
+        │   buildRefundParams()       支付宝退款参数（out_request_no, refund_amount 等）
+        │   callRefundApi()           alipay.trade.refund
+        │
+        ├── AlipayAppPayment          callGatewayApi: alipay.trade.app.pay
+        │                             formatClientResponse: {order_str: "签名串"}
+        │
+        ├── AlipayMiniPayment         callGatewayApi: alipay.trade.create
+        │                             formatClientResponse: {trade_no: "支付宝交易号"}
+        │
+        ├── AlipayWapPayment          callGatewayApi: alipay.trade.wap.pay
+        │                             formatClientResponse: {pay_url: "跳转URL"}
+        │
+        └── AlipayPagePayment         callGatewayApi: alipay.trade.page.pay
+                                      formatClientResponse: {pay_url: "跳转URL"}
+```
+
+> 每个最底层场景类只需实现 3 个方法：`buildPayParams()` + `callGatewayApi()` + `formatClientResponse()`，渠道通用的验签/解密/退款由中间层处理。
+
+#### 3.4.4 PaymentManager — 策略解析
+
+类似 Laravel 的 Manager 模式，根据支付方式 + 客户端平台自动选择 driver：
+
+```php
+class PaymentManager
+{
+    /**
+     * 根据支付渠道 + 客户端平台解析对应的支付策略实现
+     */
+    public function resolve(string $gateway, string $platform): PaymentGatewayInterface
+    {
+        $scene = $this->mapPlatformToScene($platform);
+        $driver = $gateway . '_' . $scene;
+        return $this->createDriver($driver);
+    }
+
+    private function mapPlatformToScene(string $platform): string
+    {
+        return match ($platform) {
+            'app'          => 'app',
+            'mini_program' => 'mini',
+            'h5'           => 'h5',
+            'pc'           => 'pc',
+            default        => throw new UnsupportedPaymentException("不支持的平台: {$platform}"),
+        };
+    }
+
+    private function createDriver(string $driver): PaymentGatewayInterface
+    {
+        return match ($driver) {
+            'wechat_app'  => new WechatAppPayment($this->wechatConfig),
+            'wechat_mini' => new WechatMiniPayment($this->wechatConfig),
+            'wechat_h5'   => new WechatH5Payment($this->wechatConfig),
+            'wechat_pc'   => new WechatNativePayment($this->wechatConfig),
+            'alipay_app'  => new AlipayAppPayment($this->alipayConfig),
+            'alipay_mini' => new AlipayMiniPayment($this->alipayConfig),
+            'alipay_h5'   => new AlipayWapPayment($this->alipayConfig),
+            'alipay_pc'   => new AlipayPagePayment($this->alipayConfig),
+            default       => throw new UnsupportedPaymentException("不支持的支付方式: {$driver}"),
+        };
+    }
+}
+```
+
+#### 3.4.5 支付发起时序图
+
+```
+客户端                   OrderService           PaymentManager        WechatAppPayment         微信API
+  │                          │                      │                      │                      │
+  │ POST /orders/{no}/pay   │                      │                      │                      │
+  │ {gateway: "wechat"}     │                      │                      │                      │
+  │────────────────────────→│                      │                      │                      │
+  │                          │                      │                      │                      │
+  │                          │ resolve("wechat",   │                      │                      │
+  │                          │   request.platform) │                      │                      │
+  │                          │─────────────────────→│                      │                      │
+  │                          │  WechatAppPayment   │                      │                      │
+  │                          │←─────────────────────│                      │                      │
+  │                          │                      │                      │                      │
+  │                          │ pay($order) ────────────────────────────────→│                      │
+  │                          │                      │                      │                      │
+  │                          │                      │     ┌────── 模板方法执行 ──────┐             │
+  │                          │                      │     │ 1. validateOrder()       │             │
+  │                          │                      │     │    校验 order.status=pending            │
+  │                          │                      │     │ 2. createPaymentRecord() │             │
+  │                          │                      │     │    INSERT payments 表     │             │
+  │                          │                      │     │ 3. buildPayParams()      │             │
+  │                          │                      │     │    构建APP支付参数        │             │
+  │                          │                      │     │ 4. callGatewayApi()      │             │
+  │                          │                      │     └────────────────────────────→ 统一下单   │
+  │                          │                      │                      │        │ prepay_id    │
+  │                          │                      │     ┌────────────────←────────│              │
+  │                          │                      │     │ 5. formatClientResponse()│             │
+  │                          │                      │     │    组装 SDK 调起参数      │             │
+  │                          │                      │     └──────────────────────────┘             │
+  │                          │                      │                      │                      │
+  │  200 {appId, prepayId,  │←─────────────────────────────────────────────│                      │
+  │   sign, timeStamp, ...} │                      │                      │                      │
+  │←────────────────────────│                      │                      │                      │
+  │                          │                      │                      │                      │
+  │ 调起微信SDK支付           │                      │                      │                      │
+```
+
+#### 3.4.6 回调处理时序图
+
+```
+微信/支付宝          CallbackController        PaymentManager       AbstractWechatPayment      DB
+      │                    │                       │                      │                      │
+      │ POST /payments/    │                       │                      │                      │
+      │  notify/wechat     │                       │                      │                      │
+      │───────────────────→│                       │                      │                      │
+      │                    │ resolveForCallback     │                      │                      │
+      │                    │  ("wechat")            │                      │                      │
+      │                    │──────────────────────→│                      │                      │
+      │                    │  AbstractWechat...    │                      │                      │
+      │                    │←──────────────────────│                      │                      │
+      │                    │                       │                      │                      │
+      │                    │ handleCallback($req) ────────────────────────→│                      │
+      │                    │                       │                      │                      │
+      │                    │                       │  ┌───── 模板方法执行 ─────┐                  │
+      │                    │                       │  │ 1. verifySignature()   │                  │
+      │                    │                       │  │    微信v3 AEAD验签     │                  │
+      │                    │                       │  │ 2. parseCallbackData() │                  │
+      │                    │                       │  │    AES-256-GCM 解密    │                  │
+      │                    │                       │  │ 3. processPayResult()  │                  │
+      │                    │                       │  │    事务：              ─────────────────────→│
+      │                    │                       │  │    UPDATE payments     │    BEGIN TX       │
+      │                    │                       │  │     SET status='paid'  │    UPDATE...      │
+      │                    │                       │  │    UPDATE orders       │    COMMIT         │
+      │                    │                       │  │     SET status='paid'  │←──────────────────│
+      │                    │                       │  │ 4. buildCallbackResp() │                  │
+      │                    │                       │  │    {"code":"SUCCESS"}  │                  │
+      │                    │                       │  └──────────────────────────┘                │
+      │                    │                       │                      │                      │
+      │ {"code":"SUCCESS"} │←──────────────────────────────────────────────│                      │
+      │←───────────────────│                       │                      │                      │
+```
+
+#### 3.4.7 退款流程
+
+退款由售后模块触发，通过 PaymentManager 调用对应渠道的退款 API：
+
+```
+AfterSaleService            PaymentManager         AbstractWechatPayment        微信API
+      │                          │                       │                        │
+      │ 售后审核通过，发起退款     │                       │                        │
+      │ refund($payment, $amount)│                       │                        │
+      │─────────────────────────→│                       │                        │
+      │                          │ resolve by             │                        │
+      │                          │ payment.pay_scene      │                        │
+      │                          │──────────────────────→│                        │
+      │                          │                       │                        │
+      │                          │ refund() ─────────────→│                        │
+      │                          │                       │ ┌─── 模板方法 ────┐     │
+      │                          │                       │ │ validateRefundable│    │
+      │                          │                       │ │ buildRefundParams │    │
+      │                          │                       │ │ callRefundApi  ────────→│
+      │                          │                       │ │                │  成功  │
+      │                          │                       │ │ saveRefundRecord←──────│
+      │                          │                       │ └──────────────────┘     │
+      │       RefundResult       │←──────────────────────│                        │
+      │←─────────────────────────│                       │                        │
+```
+
+> 退款时通过 `payment.pay_scene` 字段（如 `wechat_app`）自动解析对应的渠道实现，无需关心原始支付场景差异——因为同一渠道（微信/支付宝）的退款 API 是统一的，由渠道通用层 `AbstractWechatPayment` / `AbstractAlipayPayment` 处理。
+
+#### 3.4.8 回调幂等性与并发安全
+
+```
+回调请求到达
+    │
+    ├── 1. 验签（verifySignature）
+    │      失败 → 返回验签失败响应
+    │
+    ├── 2. 解析交易号，查询 payment 记录
+    │      找不到 → 返回失败
+    │
+    ├── 3. 检查 payment.status
+    │      已是 paid → 直接返回成功（幂等）
+    │
+    └── 4. 数据库事务 + 悲观锁
+           SELECT payments WHERE payment_no=? FOR UPDATE
+           │
+           ├── 再次检查 status（双重检查，防并发）
+           │    已是 paid → COMMIT，返回成功
+           │
+           └── UPDATE payments SET status='paid', gateway_trade_no=?, paid_at=NOW()
+               UPDATE orders SET status='paid', payment_method=?, paid_at=NOW()
+               COMMIT
+               │
+               └── 触发 OrderPaid 事件（异步：发通知、更新统计等）
+```
+
+使用 `SELECT ... FOR UPDATE` 悲观锁而非乐观锁，因为支付回调可能被重复推送，悲观锁在高并发下更安全。
+
+#### 3.4.9 配置管理
+
+支付配置通过 `config/payment.php` 统一管理：
+
+```php
+return [
+    'default' => env('PAYMENT_DEFAULT_GATEWAY', 'wechat'),
+
+    'gateways' => [
+        'wechat' => [
+            'app_id'     => env('WECHAT_PAY_APP_ID'),
+            'mch_id'     => env('WECHAT_PAY_MCH_ID'),
+            'api_v3_key' => env('WECHAT_PAY_API_V3_KEY'),
+            'private_key_path' => env('WECHAT_PAY_PRIVATE_KEY_PATH'),
+            'cert_serial_no'   => env('WECHAT_PAY_CERT_SERIAL_NO'),
+            'notify_url' => env('APP_URL') . '/api/v1/payments/notify/wechat',
+            // 小程序 appid（与 APP appid 不同）
+            'mini_app_id' => env('WECHAT_MINI_APP_ID'),
+        ],
+        'alipay' => [
+            'app_id'          => env('ALIPAY_APP_ID'),
+            'private_key'     => env('ALIPAY_PRIVATE_KEY'),
+            'alipay_public_key' => env('ALIPAY_PUBLIC_KEY'),
+            'notify_url'      => env('APP_URL') . '/api/v1/payments/notify/alipay',
+            'return_url'      => env('ALIPAY_RETURN_URL'),  // PC/H5 同步跳转
+        ],
+    ],
+];
+```
 
 ## 4. 数据库设计
 
@@ -1878,16 +2194,22 @@ pending → approved → returning → refunded → completed
 | payment_no | VARCHAR(32) UNIQUE | 支付单号 |
 | order_id | BIGINT UNSIGNED FK | 订单ID |
 | user_id | BIGINT UNSIGNED | 用户ID |
-| gateway | VARCHAR(20) | wechat/alipay |
+| gateway | VARCHAR(20) | 支付渠道：wechat/alipay |
+| pay_scene | VARCHAR(20) | 支付场景：wechat_app/wechat_mini/alipay_h5 等 |
 | amount | DECIMAL(10,2) | 支付金额 |
-| status | VARCHAR(20) DEFAULT 'pending' | 支付状态 |
+| status | VARCHAR(20) DEFAULT 'pending' | pending/paid/refunding/refunded/failed |
 | gateway_trade_no | VARCHAR(64) NULL | 第三方交易号 |
-| gateway_response | JSON NULL | 第三方原始数据 |
+| gateway_response | JSON NULL | 第三方原始回调数据 |
 | paid_at | TIMESTAMP NULL | 支付时间 |
+| refund_no | VARCHAR(32) NULL | 退款单号 |
+| refund_amount | DECIMAL(10,2) NULL | 退款金额 |
+| refunded_at | TIMESTAMP NULL | 退款完成时间 |
 | created_at | TIMESTAMP | |
 | updated_at | TIMESTAMP | |
 
 索引：INDEX(order_id)
+
+> `pay_scene` 记录具体支付场景（如 `wechat_app`），退款时用于自动解析对应的渠道实现。`status` 支持五种状态：pending（待支付）→ paid（已支付）→ refunding（退款中）→ refunded（已退款），任一阶段可进入 failed（失败）。
 
 #### express_companies 物流公司表
 
@@ -2009,6 +2331,7 @@ categories ─── products ──┬─ product_skus (1:N)
 | 50001 | 支付网关调用失败 |
 | 50002 | 支付回调验签失败 |
 | 50003 | 退款失败 |
+| 42208 | 不支持的支付方式（渠道+平台组合无效） |
 
 ### 5.3 API 路由
 
@@ -2111,9 +2434,10 @@ app/
 │   │   │   ├── ProductController
 │   │   │   └── CategoryController
 │   │   ├── CartController
-│   │   ├── Order/                   订单控制器
+│   │   ├── Order/                   订单控制器（含支付）
 │   │   │   ├── OrderController
-│   │   │   └── PaymentController
+│   │   │   ├── PaymentController    发起支付
+│   │   │   └── PaymentCallbackController  支付回调（独立控制器）
 │   │   ├── ShipmentController
 │   │   └── AfterSaleController
 │   ├── Middleware/                   中间件
@@ -2180,16 +2504,30 @@ app/
 │   ├── Cart/CartService
 │   ├── Order/
 │   │   ├── OrderService
-│   │   └── OrderNoGenerator
-│   ├── Payment/
-│   │   ├── PaymentService
-│   │   └── Gateway/                 支付网关（策略模式）
+│   │   ├── OrderNoGenerator
+│   │   └── Payment/                 支付子模块（模板方法+策略模式）
+│   │       ├── PaymentManager           策略解析（gateway+platform → driver）
+│   │       ├── PaymentGatewayInterface  支付网关接口契约
+│   │       ├── AbstractPaymentGateway   模板方法基类（通用流程骨架）
+│   │       ├── Wechat/                  微信支付
+│   │       │   ├── AbstractWechatPayment    微信通用层（验签/解密/退款）
+│   │       │   ├── WechatAppPayment         APP支付
+│   │       │   ├── WechatMiniPayment        小程序JSAPI支付
+│   │       │   ├── WechatH5Payment          H5支付
+│   │       │   └── WechatNativePayment      PC扫码支付
+│   │       └── Alipay/                  支付宝
+│   │           ├── AbstractAlipayPayment    支付宝通用层（验签/退款）
+│   │           ├── AlipayAppPayment         APP支付
+│   │           ├── AlipayMiniPayment        小程序支付
+│   │           ├── AlipayWapPayment         H5 WAP支付
+│   │           └── AlipayPagePayment        PC网页支付
 │   ├── Shipping/ShippingService
 │   └── AfterSale/AfterSaleService
 │
 ├── Enums/                           PHP 8.2+ 枚举
 │   ├── OrderStatus
-│   ├── PaymentStatus
+│   ├── PaymentStatus               pending/paid/refunding/refunded/failed
+│   ├── PayScene                    wechat_app/wechat_mini/.../alipay_pc
 │   ├── AfterSaleStatus
 │   ├── AfterSaleType
 │   ├── Platform
@@ -2324,7 +2662,8 @@ $this->app->bind(PaymentRepositoryInterface::class, PaymentRepository::class);
 | Repository Pattern | 数据访问抽象，接口与实现分离 |
 | 装饰器模式 | Redis 缓存层包装 Eloquent 实现，对 Service 透明 |
 | 工厂模式 | 第三方登录 SocialAuthManager |
-| 策略模式 | 支付网关 PaymentGatewayInterface |
+| 策略模式 | 支付网关 PaymentManager（渠道×场景自动解析） |
+| 模板方法模式 | 支付流程骨架 AbstractPaymentGateway（pay/handleCallback/refund） |
 | 事件驱动 | 登录日志、订单状态变更通知、库存扣减 |
 | 枚举 | 状态管理（订单/支付/售后/平台） |
 | 依赖倒置 | Service 依赖 Repository 接口，不依赖具体实现 |
@@ -2346,9 +2685,14 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 
 ### 7.3 支付回调幂等性
 
+由 `AbstractPaymentGateway.processPaymentResult()` 通用方法统一处理：
+
 - payment_no 唯一约束
-- 回调处理前先查 payment.status，已支付则直接返回成功
-- 整个回调处理在数据库事务中
+- 回调处理前先查 payment.status，已是 paid 则直接返回成功（幂等快路径）
+- 使用 `SELECT ... FOR UPDATE` 悲观锁防并发重复回调
+- 双重检查：加锁后再次校验 status，防止并发窗口期重复处理
+- 更新 payments + orders 在同一事务中
+- 事务提交后触发 OrderPaid 事件（异步通知等）
 
 ### 7.4 JWT 黑名单
 
@@ -2430,7 +2774,6 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 2. **用户认证** — 注册/登录/JWT/Refresh Token/设备管理/泄露检测
 3. **商品模块** — 分类/SPU/SKU/属性
 4. **购物车** — 依赖商品模块
-5. **订单** — 依赖购物车和商品
-6. **支付** — 依赖订单
-7. **物流** — 依赖订单
-8. **售后** — 依赖订单和支付
+5. **订单与支付** — 下单/支付网关（模板方法+策略模式）/回调/状态机
+6. **物流** — 依赖订单
+7. **售后** — 依赖订单（退款通过 PaymentManager 调用）
