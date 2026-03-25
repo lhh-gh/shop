@@ -662,7 +662,30 @@ app/
 │   └── Resources/Api/V1/            API 资源转换
 │
 ├── Models/                          17 个 Eloquent 模型
-├── Services/                        业务逻辑层
+├── Repositories/                    数据访问层（Repository Pattern）
+│   ├── Contracts/                   Repository 接口定义
+│   │   ├── UserRepositoryInterface
+│   │   ├── ProductRepositoryInterface
+│   │   ├── OrderRepositoryInterface
+│   │   ├── CartRepositoryInterface
+│   │   ├── PaymentRepositoryInterface
+│   │   └── AfterSaleRepositoryInterface
+│   ├── Eloquent/                    Eloquent 实现
+│   │   ├── BaseRepository           基础 Repository（通用 CRUD）
+│   │   ├── UserRepository
+│   │   ├── UserTokenRepository
+│   │   ├── UserSocialAccountRepository
+│   │   ├── ProductRepository
+│   │   ├── ProductSkuRepository
+│   │   ├── CategoryRepository
+│   │   ├── CartRepository
+│   │   ├── OrderRepository
+│   │   ├── PaymentRepository
+│   │   ├── ShipmentRepository
+│   │   └── AfterSaleRepository
+│   └── RepositoryServiceProvider    接口→实现绑定
+│
+├── Services/                        业务逻辑层（不直接操作 Model）
 │   ├── Auth/
 │   │   ├── AuthService              认证核心
 │   │   ├── JwtService               JWT 管理
@@ -694,15 +717,78 @@ app/
 └── Exceptions/                      自定义异常
 ```
 
-### 6.2 架构模式
+### 6.2 核心设计原则
+
+- **分层架构**：Controller → Service → Repository → Model 的清晰四层分离
+- **职责分离**：每个目录都有明确的职责边界
+- **可扩展性**：支持插件化开发和模块化扩展
+- **标准化**：遵循 PSR 规范和最佳实践
+
+#### 各层职责
+
+```
+Controller（控制器层）
+  ├── 接收请求，委托 FormRequest 做参数校验
+  ├── 调用 Service 处理业务
+  ├── 通过 Resource 格式化响应
+  └── 不包含任何业务逻辑或数据查询
+
+Service（业务逻辑层）
+  ├── 编排业务流程（如下单 = 校验库存 + 扣库存 + 创建订单 + 清购物车）
+  ├── 管理事务边界
+  ├── 触发事件
+  ├── 通过 Repository 接口访问数据，不直接操作 Model
+  └── Service 之间可以互相调用
+
+Repository（数据访问层）
+  ├── 封装所有 Eloquent 查询逻辑
+  ├── 通过接口（Contract）定义，实现依赖倒置
+  ├── 提供通用 CRUD（BaseRepository）+ 业务专用查询方法
+  ├── 未来可替换为其他 ORM 或数据源而不影响 Service 层
+  └── 复杂查询（如商品搜索/筛选）集中在 Repository 中
+
+Model（数据模型层）
+  ├── 定义表结构、关联关系、属性转换
+  ├── 定义 scope（查询作用域）
+  ├── 不包含业务逻辑
+  └── 仅被 Repository 层引用
+```
+
+#### Repository 接口示例
+
+```php
+// app/Repositories/Contracts/OrderRepositoryInterface.php
+interface OrderRepositoryInterface
+{
+    public function findByOrderNo(string $orderNo): ?Order;
+    public function getByUser(int $userId, ?string $status, int $perPage): LengthAwarePaginator;
+    public function createWithItems(array $orderData, array $items): Order;
+    public function updateStatus(int $orderId, OrderStatus $status): bool;
+    public function getExpiredPendingOrders(int $minutes): Collection;
+}
+```
+
+#### 依赖注入绑定
+
+```php
+// app/Repositories/RepositoryServiceProvider.php
+// 在 ServiceProvider 中将接口绑定到 Eloquent 实现
+$this->app->bind(OrderRepositoryInterface::class, OrderRepository::class);
+$this->app->bind(ProductRepositoryInterface::class, ProductRepository::class);
+// ...
+```
+
+### 6.3 架构模式
 
 | 模式 | 应用场景 |
 |------|----------|
-| 三层架构 | Controller → Service → Model |
+| 四层架构 | Controller → Service → Repository → Model |
+| Repository Pattern | 数据访问抽象，接口与实现分离 |
 | 工厂模式 | 第三方登录 SocialAuthManager |
 | 策略模式 | 支付网关 PaymentGatewayInterface |
 | 事件驱动 | 登录日志、订单状态变更通知、库存扣减 |
 | 枚举 | 状态管理（订单/支付/售后/平台） |
+| 依赖倒置 | Service 依赖 Repository 接口，不依赖具体实现 |
 
 ## 7. 关键实现细节
 
