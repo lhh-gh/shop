@@ -1589,7 +1589,8 @@ APP 端使用 uniapp 或 flutter，省市区数据由客户端本地维护：
 商城系统
 ├── 用户认证模块 (Auth)        → 注册/登录/Token/设备/安全
 ├── 商品模块 (Product)         → 分类/SPU/SKU/属性/搜索
-├── 购物车模块 (Cart)          → 加购/调整/选中/删除
+├── 营销模块 (Promotion)       → 促销活动/优惠券/责任链优惠计算
+├── 购物车模块 (Cart)          → 加购/合并/选中/失效检测/结算
 ├── 订单模块 (Order)           → 下单/支付/状态机/列表/详情/退款
 ├── 物流模块 (Shipping)        → 物流公司/运费模板/轨迹查询
 └── 售后模块 (AfterSale)       → 退款/退货/售后状态机
@@ -1943,6 +1944,10 @@ return [
 ```
 
 ### 3.5 订单支付与第三方对接（详细设计）
+
+微信支付：v3 已经没有独立沙箱了，官方推荐用 1 分钱真实交易测试，测完手动退款
+支付宝：有完整的沙箱环境（sandbox 账号 + 沙箱版 APP），可以模拟支付不花钱
+对我们设计的影响：
 
 3.4 定义了代码架构（模板方法+策略模式），本节描述系统与微信支付/支付宝的具体对接细节。
 
@@ -2673,6 +2678,691 @@ protected final function createPaymentRecord(Order $order, string $payScene): Pa
 | 环境隔离 | 支付宝使用沙箱环境联调（sandbox 账号+沙箱 APP，不扣真钱）；微信支付 v3 无独立沙箱，使用 1 分钱真实交易联调，测完退款。通过 .env 切换 API 地址和密钥 |
 | 密钥轮换 | 支持多证书共存（微信 serial_no 区分），轮换时新旧证书并行 |
 
+### 3.6 优惠体系详细设计（责任链模式）
+
+#### 3.6.1 优惠类型
+
+| 类型 | 层级 | 触发方式 | 示例 |
+|------|------|---------|------|
+| 满减活动 | 商品/全场 | 自动生效（平台设置） | 满 200 减 30（可阶梯） |
+| 折扣活动 | 商品/全场 | 自动生效 | 全场 8 折、指定分类 85 折 |
+| 满减券 | 订单 | 用户主动选择 | 满 100 减 15 |
+| 折扣券 | 订单 | 用户主动选择 | 9 折券，最多减 50 |
+| 无门槛券 | 订单 | 用户主动选择 | 立减 5 元 |
+| 免邮券 | 运费 | 自动匹配或用户选择 | 免运费 |
+
+#### 3.6.2 互斥与叠加规则
+
+| 规则 | 说明 |
+|------|------|
+| 同类活动不叠加 | 同一商品匹配多个满减活动时，取优先级最高的一个 |
+| 优惠券只选一张 | 一笔订单只使用一张优惠券（不含免邮券） |
+| 免邮券独立 | 免邮券与商品优惠券不互斥，可同时使用 |
+| 活动 + 券可叠加 | 促销活动和优惠券可叠加（券基于活动后金额匹配门槛） |
+
+#### 3.6.3 责任链架构
+
+每种优惠是链上的一个 Handler，按固定顺序处理。每个 Handler 判断自身是否适用，计算优惠金额写入上下文，然后传给下一个：
+
+```
+OrderContext（携带商品列表、价格、已选优惠券）
+    │
+    ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ PromotionHandler│───→│  CouponHandler  │───→│ ShippingHandler │───→│  SummaryHandler │
+│ (满减/折扣活动)  │    │ (用户优惠券)     │    │ (运费 + 免邮券) │    │ (汇总计算实付)   │
+└─────────────────┘    └─────────────────┘    └─────────────────┘    └─────────────────┘
+   逐商品匹配活动          基于活动后金额         计算运费             total - discount
+   计算优惠写入明细         匹配券+计算抵扣       抵扣免邮券           + shipping = pay
+```
+
+**链的顺序固定，体现业务约束：**
+1. **活动优惠先算** — 商品自身的促销，改变商品实际售价
+2. **优惠券后算** — 基于活动后的金额匹配门槛（满 100 减 15 的"100"是活动后金额）
+3. **运费最后算** — 基于实际支付金额和地址计算运费，免邮券抵扣运费
+4. **汇总** — 计算最终实付金额
+
+#### 3.6.4 接口与基类
+
+```php
+interface DiscountHandlerInterface
+{
+    public function setNext(DiscountHandlerInterface $handler): DiscountHandlerInterface;
+    public function handle(OrderContext $context): OrderContext;
+}
+
+abstract class AbstractDiscountHandler implements DiscountHandlerInterface
+{
+    private ?DiscountHandlerInterface $next = null;
+
+    public function setNext(DiscountHandlerInterface $handler): DiscountHandlerInterface
+    {
+        $this->next = $handler;
+        return $handler; // 支持链式调用
+    }
+
+    public function handle(OrderContext $context): OrderContext
+    {
+        $context = $this->process($context);
+
+        return $this->next ? $this->next->handle($context) : $context;
+    }
+
+    abstract protected function process(OrderContext $context): OrderContext;
+}
+```
+
+#### 3.6.5 OrderContext 上下文对象
+
+```php
+class OrderContext
+{
+    // ── 输入（下单时传入） ──
+    public array $items;           // [{sku_id, product_id, qty, unit_price}, ...]
+    public int $userId;
+    public ?int $couponId;         // 用户选择的优惠券 ID（null=不使用）
+    public ?int $addressId;        // 收货地址 ID（用于运费计算）
+
+    // ── 各 Handler 写入 ──
+    public array $promotionDetails = [];   // 活动优惠明细
+    // [{promotion_id, name, type, discount_amount, affected_sku_ids}, ...]
+
+    public ?array $couponDetail = null;    // 优惠券明细
+    // {coupon_id, user_coupon_id, name, type, discount_amount}
+
+    public float $shippingFee = 0;         // 运费
+    public float $shippingDiscount = 0;    // 免邮券减免金额
+
+    // ── SummaryHandler 汇总 ──
+    public float $totalAmount = 0;         // 商品原价总额
+    public float $promotionAmount = 0;     // 活动优惠合计
+    public float $couponAmount = 0;        // 优惠券优惠
+    public float $discountAmount = 0;      // 总优惠 = promotionAmount + couponAmount
+    public float $payAmount = 0;           // 实付 = totalAmount - discountAmount + shippingFee - shippingDiscount
+}
+```
+
+#### 3.6.6 各 Handler 详细逻辑
+
+**（1）PromotionHandler — 促销活动**
+
+```php
+class PromotionHandler extends AbstractDiscountHandler
+{
+    protected function process(OrderContext $context): OrderContext
+    {
+        // 1. 查询当前时间有效的促销活动（status=1, start_at <= now <= end_at）
+        $activePromotions = $this->promotionRepo->getActive();
+
+        // 2. 对每个商品，找出适用的活动（按 scope 匹配）
+        foreach ($context->items as &$item) {
+            $matched = $this->matchPromotion($item, $activePromotions);
+            if (!$matched) continue;
+
+            // 3. 按活动类型计算优惠
+            $discount = match ($matched->type) {
+                'full_reduction' => $this->calcFullReduction($item, $matched->rules),
+                'percentage'     => $this->calcPercentage($item, $matched->rules),
+            };
+
+            $item['promotion_discount'] = $discount;
+            $item['pay_price'] = bcsub((string)($item['unit_price'] * $item['qty']), (string)$discount, 2);
+
+            $context->promotionDetails[] = [
+                'promotion_id'    => $matched->id,
+                'name'            => $matched->name,
+                'type'            => $matched->type,
+                'discount_amount' => $discount,
+                'affected_sku_ids' => [$item['sku_id']],
+            ];
+        }
+        return $context;
+    }
+
+    // 阶梯满减计算
+    private function calcFullReduction(array $item, array $rules): float
+    {
+        $amount = bcmul((string)$item['unit_price'], (string)$item['qty'], 2);
+        $tiers = collect($rules['tiers'])->sortByDesc('min');
+
+        foreach ($tiers as $tier) {
+            if (bccomp($amount, (string)$tier['min'], 2) >= 0) {
+                return (float)$tier['discount'];
+            }
+        }
+        return 0;
+    }
+}
+```
+
+**（2）CouponHandler — 优惠券**
+
+```php
+class CouponHandler extends AbstractDiscountHandler
+{
+    protected function process(OrderContext $context): OrderContext
+    {
+        if (!$context->couponId) {
+            return $context; // 未选优惠券，跳过
+        }
+
+        // 1. 查询用户优惠券，校验归属/状态/有效期
+        $userCoupon = $this->userCouponRepo->findUnusedByUser(
+            $context->userId, $context->couponId
+        );
+        if (!$userCoupon) {
+            throw new CouponNotAvailableException();
+        }
+
+        $coupon = $userCoupon->coupon;
+
+        // 2. 计算活动后的订单金额（优惠券基于此金额匹配门槛）
+        $afterPromotionTotal = $this->calcAfterPromotionTotal($context);
+
+        // 3. 校验使用门槛
+        if (bccomp((string)$afterPromotionTotal, (string)$coupon->min_amount, 2) < 0) {
+            throw new CouponMinAmountNotMetException($coupon->min_amount);
+        }
+
+        // 4. 校验适用范围（scope=all 全部适用，scope=product/category 检查商品）
+        if (!$this->checkScope($coupon, $context->items)) {
+            throw new CouponScopeNotMatchException();
+        }
+
+        // 5. 计算优惠金额
+        $discount = match ($coupon->type) {
+            'fixed_amount'  => (float) $coupon->value,
+            'no_threshold'  => (float) $coupon->value,
+            'percentage'    => $this->calcPercentageDiscount($afterPromotionTotal, $coupon),
+            'free_shipping' => 0, // 免邮券在 ShippingHandler 处理
+        };
+
+        $context->couponDetail = [
+            'coupon_id'       => $coupon->id,
+            'user_coupon_id'  => $userCoupon->id,
+            'name'            => $coupon->name,
+            'type'            => $coupon->type,
+            'discount_amount' => $discount,
+        ];
+
+        return $context;
+    }
+
+    private function calcPercentageDiscount(float $amount, Coupon $coupon): float
+    {
+        // 折扣金额 = 原金额 × (1 - 折扣率)
+        $discount = bcmul((string)$amount, bcsub('1', (string)$coupon->value, 2), 2);
+        // 不超过最高抵扣上限
+        if ($coupon->max_discount !== null) {
+            $discount = min($discount, $coupon->max_discount);
+        }
+        return (float)$discount;
+    }
+}
+```
+
+**（3）ShippingDiscountHandler — 运费与免邮**
+
+```php
+class ShippingDiscountHandler extends AbstractDiscountHandler
+{
+    protected function process(OrderContext $context): OrderContext
+    {
+        // 1. 根据收货地址 + 商品重量 + 运费模板计算运费
+        $context->shippingFee = $this->shippingService->calculate(
+            $context->addressId, $context->items
+        );
+
+        // 2. 检查是否有免邮券（用户选择的优惠券是免邮券，或自动匹配最优免邮券）
+        $freeShippingCoupon = $this->findFreeShippingCoupon($context);
+        if ($freeShippingCoupon) {
+            $context->shippingDiscount = $context->shippingFee; // 全额免邮
+            // 记录免邮券使用
+            if (!$context->couponDetail || $context->couponDetail['type'] !== 'free_shipping') {
+                $context->freeShippingCouponId = $freeShippingCoupon->id;
+            }
+        }
+
+        return $context;
+    }
+}
+```
+
+**（4）SummaryHandler — 汇总**
+
+```php
+class SummaryHandler extends AbstractDiscountHandler
+{
+    protected function process(OrderContext $context): OrderContext
+    {
+        // 商品原价总额
+        $context->totalAmount = (float) collect($context->items)
+            ->sum(fn($item) => bcmul((string)$item['unit_price'], (string)$item['qty'], 2));
+
+        // 活动优惠合计
+        $context->promotionAmount = (float) collect($context->promotionDetails)
+            ->sum('discount_amount');
+
+        // 优惠券优惠
+        $context->couponAmount = $context->couponDetail['discount_amount'] ?? 0;
+
+        // 总优惠
+        $context->discountAmount = bcadd(
+            (string)$context->promotionAmount,
+            (string)$context->couponAmount,
+            2
+        );
+
+        // 实付 = 原价 - 优惠 + 运费 - 运费减免
+        $afterDiscount = bcsub((string)$context->totalAmount, (string)$context->discountAmount, 2);
+        $afterShipping = bcadd($afterDiscount, (string)$context->shippingFee, 2);
+        $payAmount = bcsub($afterShipping, (string)$context->shippingDiscount, 2);
+
+        // 实付不低于 0.01
+        $context->payAmount = max(0.01, (float) $payAmount);
+
+        return $context;
+    }
+}
+```
+
+#### 3.6.7 链的组装与调用
+
+```php
+// DiscountPipeline — 在 OrderService 中组装并执行
+class DiscountPipeline
+{
+    public function __construct(
+        private PromotionHandler $promotionHandler,
+        private CouponHandler $couponHandler,
+        private ShippingDiscountHandler $shippingHandler,
+        private SummaryHandler $summaryHandler,
+    ) {}
+
+    public function calculate(OrderContext $context): OrderContext
+    {
+        // 组装责任链（顺序固定）
+        $this->promotionHandler
+            ->setNext($this->couponHandler)
+            ->setNext($this->shippingHandler)
+            ->setNext($this->summaryHandler);
+
+        return $this->promotionHandler->handle($context);
+    }
+}
+
+// OrderService 下单时调用
+class OrderService
+{
+    public function createOrder(int $userId, array $cartItemIds, ?int $couponId, int $addressId): Order
+    {
+        $items = $this->buildItemsFromCart($cartItemIds);
+
+        // 通过责任链计算所有优惠
+        $context = new OrderContext(
+            items: $items,
+            userId: $userId,
+            couponId: $couponId,
+            addressId: $addressId,
+        );
+        $context = $this->discountPipeline->calculate($context);
+
+        // 使用计算结果创建订单
+        return DB::transaction(function () use ($context, $userId, $couponId, $addressId) {
+            // ... 创建订单、扣库存、核销优惠券、清购物车
+        });
+    }
+}
+```
+
+> 同样的 `DiscountPipeline` 在**下单预览**（`POST /orders/preview`）和**实际下单**（`POST /orders`）时都调用，保证预览与实际一致。
+
+#### 3.6.8 下单预览接口
+
+用户在确认订单页面看到优惠明细，需要先预览计算结果：
+
+```
+POST /api/v1/orders/preview
+Body: {cart_item_ids: [1,2,3], coupon_id: 5, address_id: 10}
+
+响应：
+{
+    "items": [
+        {"sku_id": 101, "name": "...", "unit_price": 99.00, "qty": 2, "promotion_discount": 10},
+        ...
+    ],
+    "promotion_details": [
+        {"name": "新春满200减30", "discount_amount": 30.00}
+    ],
+    "coupon_detail": {
+        "name": "满100减15券", "discount_amount": 15.00
+    },
+    "total_amount": 298.00,
+    "promotion_amount": 30.00,
+    "coupon_amount": 15.00,
+    "discount_amount": 45.00,
+    "shipping_fee": 10.00,
+    "shipping_discount": 0,
+    "pay_amount": 263.00,
+    "available_coupons": [
+        {"id": 5, "name": "满100减15", "usable": true},
+        {"id": 8, "name": "满500减80", "usable": false, "reason": "未满500元"}
+    ]
+}
+```
+
+#### 3.6.9 优惠券生命周期
+
+```
+创建（管理后台）→ 发放（用户领取）→ 使用（下单核销）→ 归还（取消订单退回）
+                        │                                     ↑
+                        └──── 过期（定时任务标记）               │
+                                                    订单取消时退回
+```
+
+**领取优惠券 `POST /coupons/{id}/claim`：**
+
+```php
+// CouponService::claim()
+public function claim(int $userId, int $couponId): UserCoupon
+{
+    $coupon = $this->couponRepo->findOrFail($couponId);
+
+    // 1. 校验：启用、在领取时间内、未领完
+    // 2. 原子操作：UPDATE coupons SET claimed_count = claimed_count + 1
+    //    WHERE id=? AND claimed_count < total_count（防超领）
+    // 3. 创建 user_coupons 记录（status=unused, expires_at=计算过期时间）
+
+    return $userCoupon;
+}
+```
+
+**下单核销（在 OrderService 事务中）：**
+
+```php
+// 更新 user_coupons：status=used, used_at=now, order_id=订单ID
+```
+
+**取消订单退回：**
+
+```php
+// OrderCancelledListener 中：
+// 若订单使用了优惠券，UPDATE user_coupons SET status=unused, used_at=NULL, order_id=NULL
+// 仅在优惠券未过期时退回
+```
+
+#### 3.6.10 促销活动规则（rules JSON 格式）
+
+**阶梯满减：**
+```json
+{
+    "tiers": [
+        {"min": 100, "discount": 10},
+        {"min": 200, "discount": 30},
+        {"min": 300, "discount": 60}
+    ]
+}
+```
+匹配规则：从高到低匹配第一个满足的阶梯。满 250 → 命中"满200减30"。
+
+**折扣：**
+```json
+{
+    "discount_rate": 0.8,
+    "max_discount": 100
+}
+```
+8 折优惠，最多优惠 100 元。
+
+### 3.7 购物车详细设计
+
+#### 3.7.1 业务规则
+
+| 规则 | 说明 |
+|------|------|
+| 容量上限 | 每个用户最多 **50** 条购物车记录 |
+| SKU 维度 | 以 SKU 为最小单位，同一 SKU 加购多次自动合并数量 |
+| 数量限制 | 单条最少 1，最多 99（不超过 SKU 实际库存） |
+| 选中状态 | 每条记录独立选中/取消，支持全选/全不选 |
+| 失效标记 | SKU 下架、库存为 0、商品删除时，购物车项标记为失效（前端灰显） |
+| 跨平台同步 | 购物车存储在数据库，多平台共享同一份数据 |
+| 价格实时性 | 购物车列表返回**当前**SKU价格，非加购时的价格 |
+
+#### 3.7.2 购物车列表数据结构
+
+购物车列表按商品维度聚合展示，每个 SKU 实时关联当前商品信息：
+
+```
+GET /api/v1/cart
+
+响应：
+{
+    "items": [
+        {
+            "id": 1,                           // cart.id
+            "quantity": 2,
+            "is_checked": true,
+            "product": {                        // 实时商品信息
+                "id": 100,
+                "title": "iPhone 15 Pro",
+                "image": "https://...",
+                "is_on_sale": true              // 是否在售
+            },
+            "sku": {                            // 实时 SKU 信息
+                "id": 201,
+                "title": "256GB 黑色钛金属",
+                "price": 8999.00,               // 当前价格（非加购时价格）
+                "stock": 50,                     // 当前库存
+                "image": "https://..."
+            },
+            "is_valid": true                     // 是否有效（综合判断）
+        },
+        {
+            "id": 2,
+            "quantity": 1,
+            "is_checked": true,
+            "product": { ... , "is_on_sale": false },
+            "sku": { ... , "stock": 0 },
+            "is_valid": false,                   // 已下架，标记失效
+            "invalid_reason": "商品已下架"
+        }
+    ],
+    "summary": {
+        "total_count": 3,                        // 总件数（仅选中+有效）
+        "total_amount": "17998.00",              // 总金额（仅选中+有效）
+        "checked_count": 2,                      // 选中数
+        "all_checked": false                     // 是否全选
+    }
+}
+```
+
+**失效判断规则（CartService 中实时计算）：**
+
+| 条件 | is_valid | invalid_reason |
+|------|---------|---------------|
+| 商品已删除（软删除） | false | 商品已失效 |
+| 商品已下架 `is_on_sale=false` | false | 商品已下架 |
+| SKU 库存为 0 | false | 暂时缺货 |
+| 购物车数量 > 当前库存 | true | 但 quantity 自动调整为库存值 |
+
+#### 3.7.3 接口详细设计
+
+**（1）加入购物车 `POST /cart`**
+
+```
+客户端                               服务端
+  │                                   │
+  │  POST /cart                       │
+  │  {sku_id: 201, quantity: 1}       │
+  │──────────────────────────────────→│
+  │                                   │ 1. 校验 SKU 存在且商品在售
+  │                                   │ 2. 校验库存 ≥ quantity
+  │                                   │ 3. 检查购物车总条数 ≤ 50
+  │                                   │ 4. UPSERT：
+  │                                   │    存在同 SKU → quantity += 新增数量
+  │                                   │    不存在 → INSERT 新记录
+  │                                   │ 5. 合并后数量不超过 99 且不超过库存
+  │     201 / 200                     │
+  │←──────────────────────────────────│
+```
+
+核心伪代码：
+
+```php
+// CartService::add()
+public function add(int $userId, int $skuId, int $quantity): CartItem
+{
+    $sku = $this->skuRepo->findOrFail($skuId);
+
+    // 校验商品在售
+    if (!$sku->product->is_on_sale) {
+        throw new ProductOffSaleException();
+    }
+
+    // 校验库存
+    if ($sku->stock < $quantity) {
+        throw new InsufficientStockException();
+    }
+
+    // UPSERT：同一 SKU 合并数量
+    $cartItem = $this->cartRepo->findByUserAndSku($userId, $skuId);
+
+    if ($cartItem) {
+        $newQty = min($cartItem->quantity + $quantity, 99, $sku->stock);
+        $cartItem->update(['quantity' => $newQty]);
+        return $cartItem;
+    }
+
+    // 新增：检查购物车总条数
+    if ($this->cartRepo->countByUser($userId) >= 50) {
+        throw new CartLimitExceededException();
+    }
+
+    return $this->cartRepo->create([
+        'user_id'        => $userId,
+        'product_sku_id' => $skuId,
+        'quantity'        => $quantity,
+        'is_checked'      => true,
+    ]);
+}
+```
+
+> 利用 `UNIQUE(user_id, product_sku_id)` 约束保证不会出现同一用户同一 SKU 的重复记录。
+
+**（2）修改数量/选中状态 `PUT /cart/{id}`**
+
+```
+客户端                               服务端
+  │                                   │
+  │  PUT /cart/1                      │
+  │  {quantity: 3}                    │ 修改数量
+  │  或 {is_checked: false}           │ 取消选中
+  │  或 {quantity: 3, is_checked: true}│ 同时修改
+  │──────────────────────────────────→│
+  │                                   │ 1. 归属校验（cart.user_id = 当前用户）
+  │                                   │ 2. quantity：校验 1-99 且 ≤ 库存
+  │                                   │ 3. UPDATE
+  │     200                           │
+  │←──────────────────────────────────│
+```
+
+**（3）删除购物车项 `DELETE /cart/{id}`**
+
+```
+客户端                               服务端
+  │                                   │
+  │  DELETE /cart/1                    │
+  │──────────────────────────────────→│
+  │                                   │ 归属校验 + 物理删除
+  │     204                           │
+  │←──────────────────────────────────│
+```
+
+**（4）批量删除 `DELETE /cart/batch`**
+
+```
+客户端                               服务端
+  │                                   │
+  │  DELETE /cart/batch                │
+  │  {ids: [1, 2, 3]}                │
+  │──────────────────────────────────→│
+  │                                   │ 归属校验 + 批量物理删除
+  │     204                           │
+  │←──────────────────────────────────│
+```
+
+**（5）全选/全不选 `PUT /cart/check-all`**
+
+```
+客户端                               服务端
+  │                                   │
+  │  PUT /cart/check-all              │
+  │  {is_checked: true}               │
+  │──────────────────────────────────→│
+  │                                   │ UPDATE carts SET is_checked=?
+  │                                   │ WHERE user_id=当前用户
+  │                                   │ (仅更新有效商品的选中状态)
+  │     200                           │
+  │←──────────────────────────────────│
+```
+
+**（6）清空失效商品 `DELETE /cart/invalid`**
+
+一键清除所有已下架/无库存的购物车项：
+
+```
+客户端                               服务端
+  │                                   │
+  │  DELETE /cart/invalid              │
+  │──────────────────────────────────→│
+  │                                   │ 查询该用户购物车中关联的
+  │                                   │ 已下架/删除/零库存的 SKU
+  │                                   │ 批量删除这些购物车记录
+  │     204                           │
+  │←──────────────────────────────────│
+```
+
+#### 3.7.4 购物车与下单的衔接
+
+```
+购物车页                确认订单页                         服务端
+  │                       │                                │
+  │ 1. 勾选商品，点击       │                                │
+  │    "去结算"             │                                │
+  │──────────────────────→│                                │
+  │                       │ 2. POST /orders/preview         │
+  │                       │    {cart_item_ids: [1,2,3],     │
+  │                       │     address_id: 10}             │
+  │                       │───────────────────────────────→│
+  │                       │                                │ 3. 校验购物车项有效性
+  │                       │                                │ 4. 查询可用优惠券列表
+  │                       │                                │ 5. 执行 DiscountPipeline
+  │                       │                                │    （不选券的默认计算）
+  │                       │ 6. 返回预览结果 + 可用券列表     │
+  │                       │←───────────────────────────────│
+  │                       │                                │
+  │                       │ 7. 用户选择优惠券/修改地址       │
+  │                       │    重新 POST /orders/preview    │
+  │                       │    {cart_item_ids, coupon_id,   │
+  │                       │     address_id}                 │
+  │                       │───────────────────────────────→│
+  │                       │ 8. 返回更新后的预览结果          │
+  │                       │←───────────────────────────────│
+  │                       │                                │
+  │                       │ 9. 确认下单                     │
+  │                       │    POST /orders                 │
+  │                       │    {cart_item_ids, coupon_id,   │
+  │                       │     address_id, remark}         │
+  │                       │───────────────────────────────→│
+  │                       │                                │ 10. 再次执行 DiscountPipeline
+  │                       │                                │ 11. 事务：扣库存+创建订单
+  │                       │                                │     +核销优惠券+清购物车
+  │                       │ 12. {order_no}                  │
+  │                       │←───────────────────────────────│
+```
+
+> **下单时再次计算优惠**：不信任客户端传来的金额，服务端重新执行 DiscountPipeline 确保金额正确。预览和下单使用同一套计算逻辑。
+
 ### 4.1 用户认证相关（5 张表）
 
 #### users 用户表
@@ -2835,7 +3525,7 @@ protected final function createPaymentRecord(Order $order, string $payScene): Pa
 
 > 注：此表不使用 Eloquent 时间戳（`$timestamps = false`）。
 
-### 4.3 交易相关（9 张表）
+### 4.3 交易相关（12 张表）
 
 #### user_addresses 收货地址表
 
@@ -2869,6 +3559,60 @@ protected final function createPaymentRecord(Order $order, string $payScene): Pa
 
 唯一约束：UNIQUE(user_id, product_sku_id)
 
+#### promotions 促销活动表
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT UNSIGNED PK | 主键 |
+| name | VARCHAR(100) | 活动名称 |
+| type | VARCHAR(20) | full_reduction / percentage |
+| rules | JSON | 活动规则（阶梯满减/折扣率+上限） |
+| scope | VARCHAR(20) | all / product / category |
+| scope_ids | JSON NULL | 适用商品/分类 ID 列表（scope=all 时为空） |
+| priority | INT DEFAULT 0 | 优先级（同类活动取最高） |
+| start_at | TIMESTAMP | 生效时间 |
+| end_at | TIMESTAMP | 结束时间 |
+| status | TINYINT DEFAULT 1 | 1启用 0停用 |
+| created_at | TIMESTAMP | |
+| updated_at | TIMESTAMP | |
+
+索引：INDEX(status, start_at, end_at)
+
+#### coupons 优惠券模板表
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT UNSIGNED PK | 主键 |
+| name | VARCHAR(100) | 券名称 |
+| type | VARCHAR(20) | fixed_amount / percentage / no_threshold / free_shipping |
+| value | DECIMAL(10,2) | 面值：固定金额(元) / 折扣率(如 0.85=85折) |
+| min_amount | DECIMAL(10,2) DEFAULT 0 | 使用门槛（满X可用，0=无门槛） |
+| max_discount | DECIMAL(10,2) NULL | 最高抵扣（折扣券用，NULL=不限） |
+| scope | VARCHAR(20) | all / product / category |
+| scope_ids | JSON NULL | 适用范围 ID 列表 |
+| total_count | INT | 发行总量 |
+| claimed_count | INT DEFAULT 0 | 已领取数量 |
+| start_at | TIMESTAMP | 可用开始时间 |
+| end_at | TIMESTAMP | 可用结束时间 |
+| status | TINYINT DEFAULT 1 | 1启用 0停用 |
+| created_at | TIMESTAMP | |
+| updated_at | TIMESTAMP | |
+
+#### user_coupons 用户已领优惠券表
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT UNSIGNED PK | 主键 |
+| user_id | BIGINT UNSIGNED FK | 用户ID |
+| coupon_id | BIGINT UNSIGNED FK | 优惠券模板ID |
+| status | VARCHAR(20) DEFAULT 'unused' | unused / used / expired |
+| used_at | TIMESTAMP NULL | 使用时间 |
+| order_id | BIGINT UNSIGNED NULL FK | 使用的订单ID |
+| expires_at | TIMESTAMP | 过期时间 |
+| created_at | TIMESTAMP | 领取时间 |
+
+索引：INDEX(user_id, status)
+
 #### orders 订单表
 
 | 字段 | 类型 | 说明 |
@@ -2878,9 +3622,11 @@ protected final function createPaymentRecord(Order $order, string $payScene): Pa
 | user_id | BIGINT UNSIGNED FK | 用户ID |
 | address_snapshot | JSON | 收货地址快照 |
 | total_amount | DECIMAL(10,2) | 商品总额 |
-| discount_amount | DECIMAL(10,2) DEFAULT 0 | 优惠金额（预留，V1默认为0） |
+| discount_amount | DECIMAL(10,2) DEFAULT 0 | 总优惠金额（活动+优惠券） |
 | shipping_fee | DECIMAL(10,2) DEFAULT 0 | 运费 |
-| pay_amount | DECIMAL(10,2) | 实付金额（= total_amount - discount_amount + shipping_fee） |
+| pay_amount | DECIMAL(10,2) | 实付 = total - discount + shipping - shipping_discount |
+| coupon_id | BIGINT UNSIGNED NULL FK | 使用的优惠券模板ID |
+| discount_detail | JSON NULL | 优惠明细快照（活动+券明细，审计/展示用） |
 | status | VARCHAR(20) DEFAULT 'pending' | 订单状态 |
 | payment_method | VARCHAR(20) NULL | 支付方式 |
 | paid_at | TIMESTAMP NULL | 支付时间 |
@@ -3011,6 +3757,7 @@ users ─┬─ user_social_accounts (1:N)
        ├─ password_histories (1:N)
        ├─ user_addresses (1:N)
        ├─ carts (1:N)
+       ├─ user_coupons ─── coupons (N:1)
        ├─ orders ──┬─ order_items (1:N)
        │           ├─ payments (1:N)
        │           ├─ shipments (1:N)
@@ -3019,9 +3766,12 @@ users ─┬─ user_social_accounts (1:N)
 
 categories ─── products ──┬─ product_skus (1:N)
                           └─ product_attributes (1:N)
+
+promotions（独立，通过 scope+scope_ids 关联商品/分类）
+coupons ─── user_coupons (1:N)
 ```
 
-共 **18 张表**。
+共 **21 张表**。
 
 ## 5. API 设计
 
@@ -3062,6 +3812,12 @@ categories ─── products ──┬─ product_skus (1:N)
 | 50002 | 支付回调验签失败 |
 | 50003 | 退款失败 |
 | 42208 | 不支持的支付方式（渠道+平台组合无效） |
+| 42209 | 优惠券不可用（不存在/已使用/已过期） |
+| 42210 | 未满足优惠券使用门槛 |
+| 42211 | 优惠券不适用于当前商品 |
+| 42212 | 优惠券已领完 |
+| 42213 | 购物车数量超限（最多 50 条） |
+| 42214 | 商品已下架 |
 
 ### 5.3 API 路由
 
@@ -3115,11 +3871,19 @@ PUT    /api/v1/user/addresses/{id}         修改收货地址
 DELETE /api/v1/user/addresses/{id}         删除收货地址
 PATCH  /api/v1/user/addresses/{id}/default 设为默认地址
 
-GET    /api/v1/cart                         购物车列表
-POST   /api/v1/cart                         加入购物车
+GET    /api/v1/cart                         购物车列表（含实时价格+失效标记）
+POST   /api/v1/cart                         加入购物车（同SKU自动合并）
 PUT    /api/v1/cart/{id}                    修改数量/选中状态
 DELETE /api/v1/cart/{id}                    删除购物车项
+DELETE /api/v1/cart/batch                   批量删除 {ids: [...]}
+PUT    /api/v1/cart/check-all              全选/全不选 {is_checked: bool}
+DELETE /api/v1/cart/invalid                 清空失效商品
 
+GET    /api/v1/coupons                      可领取优惠券列表
+POST   /api/v1/coupons/{id}/claim           领取优惠券
+GET    /api/v1/user/coupons                 我的优惠券列表（支持 status 筛选）
+
+POST   /api/v1/orders/preview               下单预览（计算优惠+可用券列表）
 POST   /api/v1/orders                      创建订单
 GET    /api/v1/orders                       订单列表
 GET    /api/v1/orders/{no}                  订单详情
@@ -3165,6 +3929,7 @@ app/
 │   │   │   ├── ProductController
 │   │   │   └── CategoryController
 │   │   ├── CartController
+│   │   ├── CouponController            优惠券领取/列表
 │   │   ├── Order/                   订单控制器（含支付）
 │   │   │   ├── OrderController
 │   │   │   ├── PaymentController    发起支付
@@ -3196,6 +3961,8 @@ app/
 │   │   ├── ProductRepositoryInterface
 │   │   ├── OrderRepositoryInterface
 │   │   ├── CartRepositoryInterface
+│   │   ├── CouponRepositoryInterface
+│   │   ├── PromotionRepositoryInterface
 │   │   ├── PaymentRepositoryInterface
 │   │   └── AfterSaleRepositoryInterface
 │   ├── Eloquent/                    MySQL 实现（Eloquent ORM）
@@ -3208,6 +3975,9 @@ app/
 │   │   ├── ProductSkuRepository
 │   │   ├── CategoryRepository
 │   │   ├── CartRepository
+│   │   ├── CouponRepository
+│   │   ├── UserCouponRepository
+│   │   ├── PromotionRepository
 │   │   ├── OrderRepository
 │   │   ├── PaymentRepository
 │   │   ├── ShipmentRepository
@@ -3233,6 +4003,18 @@ app/
 │   │   └── AddressService           收货地址 CRUD + 默认地址管理
 │   ├── Product/ProductService
 │   ├── Cart/CartService
+│   ├── Promotion/                   营销模块
+│   │   ├── CouponService            优惠券领取/核销/退回
+│   │   ├── PromotionService         促销活动查询/匹配
+│   │   └── Discount/                责任链优惠计算
+│   │       ├── DiscountHandlerInterface
+│   │       ├── AbstractDiscountHandler
+│   │       ├── DiscountPipeline         链的组装与调用入口
+│   │       ├── PromotionHandler         促销活动（满减/折扣）
+│   │       ├── CouponHandler            优惠券
+│   │       ├── ShippingDiscountHandler  运费+免邮
+│   │       ├── SummaryHandler           汇总计算实付
+│   │       └── OrderContext             上下文对象
 │   ├── Order/
 │   │   ├── OrderService
 │   │   ├── OrderNoGenerator
@@ -3259,6 +4041,9 @@ app/
 │   ├── OrderStatus
 │   ├── PaymentStatus               pending/paid/refunding/refunded/failed
 │   ├── PayScene                    wechat_app/wechat_mini/.../alipay_pc
+│   ├── CouponType                  fixed_amount/percentage/no_threshold/free_shipping
+│   ├── CouponStatus                unused/used/expired
+│   ├── PromotionType               full_reduction/percentage
 │   ├── AfterSaleStatus
 │   ├── AfterSaleType
 │   ├── Platform
@@ -3395,6 +4180,7 @@ $this->app->bind(PaymentRepositoryInterface::class, PaymentRepository::class);
 | 工厂模式 | 第三方登录 SocialAuthManager |
 | 策略模式 | 支付网关 PaymentManager（渠道×场景自动解析） |
 | 模板方法模式 | 支付流程骨架 AbstractPaymentGateway（pay/handleCallback/refund） |
+| 责任链模式 | 优惠计算 DiscountPipeline（活动→优惠券→运费→汇总） |
 | 事件驱动 | 登录日志、订单状态变更通知、库存扣减 |
 | 枚举 | 状态管理（订单/支付/售后/平台） |
 | 依赖倒置 | Service 依赖 Repository 接口，不依赖具体实现 |
@@ -3441,12 +4227,14 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 
 整个下单流程在数据库事务中执行：
 1. 校验购物车商品有效性（商品上架、SKU存在）
-2. 乐观锁扣减库存（失败则回滚）
-3. 创建 Order 记录
-4. 创建 OrderItem 记录（快照商品信息）
-5. 清除已下单的购物车条目
-6. 事务提交
-7. 触发 OrderCreated 事件
+2. 执行 DiscountPipeline 责任链计算优惠（活动→优惠券→运费→汇总）
+3. 乐观锁扣减库存（失败则回滚）
+4. 创建 Order 记录（含 discount_amount, coupon_id, discount_detail）
+5. 创建 OrderItem 记录（快照商品信息）
+6. 核销优惠券（user_coupons.status → used）
+7. 清除已下单的购物车条目
+8. 事务提交
+9. 触发 OrderCreated 事件
 
 ### 7.7 定时任务
 
@@ -3456,6 +4244,7 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 | 每分钟 | QueryPendingPayments | 主动查询5-30分钟内的待支付记录（回调丢失兜底） |
 | 每天 | CleanExpiredTokens | 清理过期 Refresh Token |
 | 每天 | AutoConfirmOrder | 自动确认收货（15天） |
+| 每天 | ExpireUserCoupons | 标记过期优惠券 status → expired |
 | 每6小时 | QueryShipmentTrace | 批量查询物流轨迹 |
 
 ### 7.8 频率限制
@@ -3505,7 +4294,8 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 1. **基础设施** — 统一响应格式、异常处理、中间件
 2. **用户认证** — 注册/登录/JWT/Refresh Token/设备管理/泄露检测
 3. **商品模块** — 分类/SPU/SKU/属性
-4. **购物车** — 依赖商品模块
-5. **订单与支付** — 下单/支付网关（模板方法+策略模式）/回调/状态机
-6. **物流** — 依赖订单
-7. **售后** — 依赖订单（退款通过 PaymentManager 调用）
+4. **营销模块** — 促销活动/优惠券/责任链优惠计算管道
+5. **购物车** — 加购/合并/选中/失效检测
+6. **订单与支付** — 下单预览/下单（含优惠计算）/支付网关/回调/状态机
+7. **物流** — 依赖订单
+8. **售后** — 依赖订单（退款+优惠券退回）
