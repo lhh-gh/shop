@@ -4301,19 +4301,1320 @@ UPDATE product_skus SET stock = stock - {qty} WHERE id = {id} AND stock >= {qty}
 - **订单地址快照**：`orders.address_snapshot` JSON 字段存储完整地址数据，展示时通过 `OrderResource` 内联脱敏
 - **安全原则**：永远不在 API 响应中返回 password、第三方 access_token/refresh_token 等凭证字段
 
-## 8. 异常处理
+## 8. 异常处理与日志体系
 
-全局异常处理器统一捕获并转换为 API 响应：
+> 本节覆盖：自定义异常分层、全局异常处理器、统一错误响应、应用日志分层、请求全链路日志、SQL 查询日志、慢查询监控与告警。
 
-| 异常类型 | HTTP 状态码 | 业务错误码 |
-|---------|-------------|-----------|
-| ValidationException | 422 | 字段级错误 |
-| AuthenticationException | 401 | 401xx |
-| ModelNotFoundException | 404 | - |
-| TokenLeakException | 401 | 40103 |
-| DeviceKickedException | 401 | 40104 |
-| InsufficientStockException | 422 | 42201 |
-| 其他异常 | 500 | 生产环境隐藏详情 |
+---
+
+### 8.1 异常分层体系
+
+#### 设计原则
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     异常分层金字塔                                   │
+│                                                                     │
+│               ┌──────────────────┐                                 │
+│               │   \Throwable     │  PHP 顶层                       │
+│               └────────┬─────────┘                                 │
+│                        │                                            │
+│               ┌────────┴─────────┐                                 │
+│               │   \Exception     │  PHP 基类                       │
+│               └────────┬─────────┘                                 │
+│                        │                                            │
+│          ┌─────────────┼─────────────┐                             │
+│          │                           │                              │
+│  ┌───────┴────────┐      ┌──────────┴──────────┐                  │
+│  │ Laravel 内置    │      │  App\Exceptions\     │                  │
+│  │ 异常（直接映射） │      │  BusinessException   │  ← 业务异常基类  │
+│  └────────────────┘      └──────────┬──────────┘                  │
+│                                     │                              │
+│          ┌──────────┬──────────┬────┴────┬──────────┐             │
+│          │          │          │         │          │              │
+│     Auth异常   Order异常  Payment异常  Stock异常  Coupon异常       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 业务异常基类
+
+```php
+namespace App\Exceptions;
+
+use Exception;
+
+/**
+ * 所有业务异常的基类
+ * 携带 HTTP 状态码 + 业务错误码 + 用户友好消息
+ */
+abstract class BusinessException extends Exception
+{
+    public function __construct(
+        protected int    $httpStatus,     // HTTP 状态码 (400/401/403/404/409/422/429)
+        protected int    $errorCode,      // 业务错误码 (5 位数)
+        string           $message = '',   // 内部调试消息 (不暴露给用户)
+        protected string $userMessage = '操作失败，请稍后重试', // 返回给前端的消息
+        protected array  $data = [],      // 附加数据 (如字段级错误)
+        ?\Throwable      $previous = null,
+    ) {
+        parent::__construct($message ?: $userMessage, $errorCode, $previous);
+    }
+
+    public function getHttpStatus(): int    { return $this->httpStatus; }
+    public function getErrorCode(): int     { return $this->errorCode; }
+    public function getUserMessage(): string { return $this->userMessage; }
+    public function getData(): array        { return $this->data; }
+}
+```
+
+#### 按模块定义具体异常
+
+```php
+// ==================== 认证模块 ====================
+namespace App\Exceptions\Auth;
+
+use App\Exceptions\BusinessException;
+
+class InvalidCredentialsException extends BusinessException
+{
+    public function __construct()
+    {
+        parent::__construct(401, 40101, '密码校验失败', '账号或密码错误');
+    }
+}
+
+class SmsCodeInvalidException extends BusinessException
+{
+    public function __construct()
+    {
+        parent::__construct(401, 40102, '短信验证码不匹配', '验证码错误或已过期');
+    }
+}
+
+class TokenLeakException extends BusinessException
+{
+    public function __construct(int $userId, string $platform)
+    {
+        parent::__construct(
+            401, 40103,
+            "Token泄露检测: user={$userId}, platform={$platform}",
+            '检测到账号异常，请重新登录'
+        );
+    }
+}
+
+class DeviceKickedException extends BusinessException
+{
+    public function __construct()
+    {
+        parent::__construct(401, 40104, '设备被踢下线', '您的账号在其他设备登录');
+    }
+}
+
+class UserDisabledException extends BusinessException
+{
+    public function __construct(int $userId)
+    {
+        parent::__construct(403, 40105, "用户已禁用: {$userId}", '您的账号已被禁用');
+    }
+}
+
+class SmsSendTooFrequentException extends BusinessException
+{
+    public function __construct()
+    {
+        parent::__construct(429, 40106, '短信发送频率过高', '操作过于频繁，请稍后再试');
+    }
+}
+
+class RefreshTokenExpiredException extends BusinessException
+{
+    public function __construct()
+    {
+        parent::__construct(401, 40107, 'Refresh Token 已过期', '登录已过期，请重新登录');
+    }
+}
+
+// ==================== 订单模块 ====================
+namespace App\Exceptions\Order;
+
+class OrderNotFoundException extends BusinessException
+{
+    public function __construct(string $orderNo)
+    {
+        parent::__construct(404, 42001, "订单不存在: {$orderNo}", '订单不存在');
+    }
+}
+
+class OrderStatusException extends BusinessException
+{
+    public function __construct(string $orderNo, string $from, string $to)
+    {
+        parent::__construct(
+            409, 42002,
+            "订单状态不允许转换: {$orderNo} {$from}→{$to}",
+            '当前订单状态不支持此操作'
+        );
+    }
+}
+
+class DuplicateOrderException extends BusinessException
+{
+    public function __construct(string $idempotencyToken)
+    {
+        parent::__construct(409, 42003, "重复下单: {$idempotencyToken}", '订单已提交，请勿重复操作');
+    }
+}
+
+class OrderExpiredException extends BusinessException
+{
+    public function __construct(string $orderNo)
+    {
+        parent::__construct(410, 42004, "订单已超时: {$orderNo}", '订单已超时关闭');
+    }
+}
+
+// ==================== 支付模块 ====================
+namespace App\Exceptions\Payment;
+
+class PaymentGatewayException extends BusinessException
+{
+    public function __construct(string $channel, string $reason)
+    {
+        parent::__construct(
+            502, 43001,
+            "支付网关错误: {$channel} - {$reason}",
+            '支付通道暂时不可用，请稍后重试'
+        );
+    }
+}
+
+class PaymentCallbackInvalidException extends BusinessException
+{
+    public function __construct(string $channel, string $reason)
+    {
+        parent::__construct(400, 43002, "支付回调验签失败: {$channel} - {$reason}", '');
+    }
+}
+
+class PaymentAlreadyPaidException extends BusinessException
+{
+    public function __construct(string $orderNo)
+    {
+        parent::__construct(409, 43003, "订单已支付: {$orderNo}", '订单已支付，无需重复支付');
+    }
+}
+
+// ==================== 库存模块 ====================
+namespace App\Exceptions\Stock;
+
+class InsufficientStockException extends BusinessException
+{
+    public function __construct(int $skuId, int $requested, int $available)
+    {
+        parent::__construct(
+            422, 44001,
+            "库存不足: sku={$skuId}, 需要={$requested}, 可用={$available}",
+            '商品库存不足',
+            ['sku_id' => $skuId, 'available' => $available]
+        );
+    }
+}
+
+// ==================== 优惠券模块 ====================
+namespace App\Exceptions\Coupon;
+
+class CouponExpiredException extends BusinessException
+{
+    public function __construct(int $couponId)
+    {
+        parent::__construct(410, 45001, "优惠券已过期: {$couponId}", '优惠券已过期');
+    }
+}
+
+class CouponAlreadyClaimedException extends BusinessException
+{
+    public function __construct(int $userId, int $couponId)
+    {
+        parent::__construct(409, 45002, "重复领券: user={$userId}, coupon={$couponId}", '您已领取过该优惠券');
+    }
+}
+
+class CouponDepletedException extends BusinessException
+{
+    public function __construct(int $couponId)
+    {
+        parent::__construct(410, 45003, "优惠券已领完: {$couponId}", '优惠券已被领完');
+    }
+}
+
+class CouponNotApplicableException extends BusinessException
+{
+    public function __construct(string $reason)
+    {
+        parent::__construct(422, 45004, "优惠券不满足使用条件: {$reason}", '不满足优惠券使用条件');
+    }
+}
+
+// ==================== 地址模块 ====================
+namespace App\Exceptions\Address;
+
+class AddressLimitExceededException extends BusinessException
+{
+    public function __construct(int $limit = 20)
+    {
+        parent::__construct(422, 46001, "地址数量超限: {$limit}", "最多保存{$limit}个收货地址");
+    }
+}
+
+// ==================== 通用模块 ====================
+namespace App\Exceptions;
+
+class RateLimitExceededException extends BusinessException
+{
+    public function __construct(string $action, int $retryAfter)
+    {
+        parent::__construct(
+            429, 49001,
+            "频率限制: {$action}",
+            '操作过于频繁，请稍后再试',
+            ['retry_after' => $retryAfter]
+        );
+    }
+}
+
+class ForbiddenException extends BusinessException
+{
+    public function __construct(string $action = '')
+    {
+        parent::__construct(403, 49002, "无权操作: {$action}", '您没有权限执行此操作');
+    }
+}
+```
+
+#### 业务错误码规范
+
+```
+错误码规则：5位数字，模块码(2位) + 序号(3位)
+
+模块码分配：
+  40xxx — 认证模块 (Auth)
+  41xxx — 用户模块 (User)
+  42xxx — 订单模块 (Order)
+  43xxx — 支付模块 (Payment)
+  44xxx — 库存模块 (Stock)
+  45xxx — 优惠券模块 (Coupon)
+  46xxx — 地址模块 (Address)
+  47xxx — 物流模块 (Shipping)
+  48xxx — 售后模块 (AfterSale)
+  49xxx — 通用 (Common)
+```
+
+#### 异常 → HTTP 映射总览
+
+| 异常类 | HTTP 状态码 | 错误码 | 用户消息 |
+|--------|-----------|--------|---------|
+| InvalidCredentialsException | 401 | 40101 | 账号或密码错误 |
+| SmsCodeInvalidException | 401 | 40102 | 验证码错误或已过期 |
+| TokenLeakException | 401 | 40103 | 检测到账号异常，请重新登录 |
+| DeviceKickedException | 401 | 40104 | 您的账号在其他设备登录 |
+| UserDisabledException | 403 | 40105 | 您的账号已被禁用 |
+| SmsSendTooFrequentException | 429 | 40106 | 操作过于频繁 |
+| RefreshTokenExpiredException | 401 | 40107 | 登录已过期 |
+| OrderNotFoundException | 404 | 42001 | 订单不存在 |
+| OrderStatusException | 409 | 42002 | 当前订单状态不支持此操作 |
+| DuplicateOrderException | 409 | 42003 | 订单已提交 |
+| OrderExpiredException | 410 | 42004 | 订单已超时关闭 |
+| PaymentGatewayException | 502 | 43001 | 支付通道暂时不可用 |
+| PaymentCallbackInvalidException | 400 | 43002 | (不返回给前端) |
+| PaymentAlreadyPaidException | 409 | 43003 | 订单已支付 |
+| InsufficientStockException | 422 | 44001 | 商品库存不足 |
+| CouponExpiredException | 410 | 45001 | 优惠券已过期 |
+| CouponAlreadyClaimedException | 409 | 45002 | 您已领取过该优惠券 |
+| CouponDepletedException | 410 | 45003 | 优惠券已被领完 |
+| CouponNotApplicableException | 422 | 45004 | 不满足使用条件 |
+| AddressLimitExceededException | 422 | 46001 | 最多保存20个 |
+| RateLimitExceededException | 429 | 49001 | 操作过于频繁 |
+| ForbiddenException | 403 | 49002 | 没有权限 |
+| ValidationException (Laravel) | 422 | 49900 | 字段级错误 |
+| ModelNotFoundException (Laravel) | 404 | 49901 | 资源不存在 |
+| AuthenticationException (Laravel) | 401 | 49902 | 请先登录 |
+| ThrottleRequestsException (Laravel) | 429 | 49903 | 请求过于频繁 |
+| 其他未知 Exception | 500 | 50000 | 服务器内部错误 |
+
+---
+
+### 8.2 全局异常处理器
+
+#### Laravel 12 异常处理入口 (bootstrap/app.php)
+
+```php
+// bootstrap/app.php
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(...)
+    ->withMiddleware(function (Middleware $middleware) { ... })
+    ->withExceptions(function (Exceptions $exceptions) {
+
+        // ──── 业务异常：结构化 JSON 响应 ────
+        $exceptions->renderable(function (BusinessException $e, $request) {
+            $response = [
+                'code'    => $e->getErrorCode(),
+                'message' => $e->getUserMessage(),
+                'data'    => $e->getData() ?: null,
+            ];
+
+            // 开发环境附加调试信息
+            if (app()->isLocal()) {
+                $response['debug'] = [
+                    'exception' => get_class($e),
+                    'internal_message' => $e->getMessage(),
+                    'file'  => $e->getFile() . ':' . $e->getLine(),
+                    'trace' => collect($e->getTrace())->take(5)->toArray(),
+                ];
+            }
+
+            return response()->json($response, $e->getHttpStatus());
+        });
+
+        // ──── Laravel 验证异常：转为统一格式 ────
+        $exceptions->renderable(function (ValidationException $e, $request) {
+            return response()->json([
+                'code'    => 49900,
+                'message' => '参数验证失败',
+                'data'    => [
+                    'errors' => $e->errors(),  // ['field' => ['错误信息1', ...]]
+                ],
+            ], 422);
+        });
+
+        // ──── Laravel 模型未找到 ────
+        $exceptions->renderable(function (ModelNotFoundException $e, $request) {
+            $model = class_basename($e->getModel());
+            return response()->json([
+                'code'    => 49901,
+                'message' => "{$model}不存在",
+                'data'    => null,
+            ], 404);
+        });
+
+        // ──── Laravel 认证异常 ────
+        $exceptions->renderable(function (AuthenticationException $e, $request) {
+            return response()->json([
+                'code'    => 49902,
+                'message' => '请先登录',
+                'data'    => null,
+            ], 401);
+        });
+
+        // ──── Laravel 限流异常 ────
+        $exceptions->renderable(function (ThrottleRequestsException $e, $request) {
+            return response()->json([
+                'code'    => 49903,
+                'message' => '请求过于频繁，请稍后再试',
+                'data'    => ['retry_after' => $e->getHeaders()['Retry-After'] ?? 60],
+            ], 429);
+        });
+
+        // ──── 兜底：未知异常 ────
+        $exceptions->renderable(function (\Throwable $e, $request) {
+            // 只拦截 API 请求
+            if (! $request->is('api/*') && ! $request->expectsJson()) {
+                return null; // 让 Laravel 默认处理
+            }
+
+            $response = [
+                'code'    => 50000,
+                'message' => '服务器内部错误',
+                'data'    => null,
+            ];
+
+            if (app()->isLocal()) {
+                $response['debug'] = [
+                    'exception' => get_class($e),
+                    'message'   => $e->getMessage(),
+                    'file'      => $e->getFile() . ':' . $e->getLine(),
+                    'trace'     => collect($e->getTrace())->take(10)->toArray(),
+                ];
+            }
+
+            return response()->json($response, 500);
+        });
+
+        // ──── 异常上报（生产环境记录日志） ────
+        $exceptions->reportable(function (BusinessException $e) {
+            // 业务异常只记录 warning 级别
+            Log::channel('business')->warning($e->getMessage(), [
+                'error_code' => $e->getErrorCode(),
+                'http_status' => $e->getHttpStatus(),
+                'user_id'   => auth()->id(),
+                'url'       => request()->fullUrl(),
+                'ip'        => request()->ip(),
+            ]);
+            return false; // 阻止 Laravel 默认上报
+        });
+
+        $exceptions->reportable(function (\Throwable $e) {
+            // 非业务异常记录 error 级别（含完整堆栈）
+            Log::channel('error')->error($e->getMessage(), [
+                'exception' => get_class($e),
+                'file'      => $e->getFile() . ':' . $e->getLine(),
+                'trace'     => $e->getTraceAsString(),
+                'user_id'   => auth()->id(),
+                'url'       => request()->fullUrl(),
+                'input'     => request()->except(['password', 'password_confirmation']),
+                'ip'        => request()->ip(),
+            ]);
+        });
+    })
+    ->create();
+```
+
+#### 统一 JSON 响应格式
+
+```
+成功响应：
+{
+    "code": 0,
+    "message": "success",
+    "data": { ... }
+}
+
+业务异常响应 (4xx)：
+{
+    "code": 42002,
+    "message": "当前订单状态不支持此操作",
+    "data": null
+}
+
+验证异常响应 (422)：
+{
+    "code": 49900,
+    "message": "参数验证失败",
+    "data": {
+        "errors": {
+            "phone": ["手机号格式不正确"],
+            "quantity": ["数量必须大于0"]
+        }
+    }
+}
+
+服务器错误响应 (500, 生产环境)：
+{
+    "code": 50000,
+    "message": "服务器内部错误",
+    "data": null
+}
+
+服务器错误响应 (500, 开发环境)：
+{
+    "code": 50000,
+    "message": "服务器内部错误",
+    "data": null,
+    "debug": {
+        "exception": "PDOException",
+        "message": "SQLSTATE[42S02]: Base table or view not found...",
+        "file": "/app/Repositories/Eloquent/OrderRepository.php:87",
+        "trace": [...]
+    }
+}
+```
+
+#### 异常处理流程图
+
+```
+                        请求进入
+                          │
+                          ▼
+                    ┌───────────┐
+                    │ Controller │
+                    │ / Service  │
+                    └─────┬─────┘
+                          │ 抛出异常
+                          ▼
+              ┌───────────────────────┐
+              │ bootstrap/app.php     │
+              │ withExceptions()      │
+              └───────────┬───────────┘
+                          │
+              ┌───────────┴───────────┐
+              │   reportable() 先执行  │ ← 记录日志（不影响响应）
+              └───────────┬───────────┘
+                          │
+              ┌───────────┴───────────┐
+              │   renderable() 后执行  │ ← 决定返回什么 JSON
+              └───────────┬───────────┘
+                          │
+            ┌─────────────┼──────────────┐──────────────┐
+            │             │              │              │
+            ▼             ▼              ▼              ▼
+    BusinessException  Validation  ModelNotFound   \Throwable
+    → 业务错误码       → 422+字段   → 404           → 500
+    → 用户友好消息     → errors[]   → {Model}不存在  → 生产隐藏详情
+            │             │              │              │
+            └─────────────┴──────────────┴──────────────┘
+                          │
+                          ▼
+                    JSON Response
+                  (统一 code/message/data)
+```
+
+#### 异常目录结构
+
+```
+app/Exceptions/
+├── BusinessException.php                 业务异常基类
+├── RateLimitExceededException.php        通用频率限制
+├── ForbiddenException.php                通用无权限
+├── Auth/
+│   ├── InvalidCredentialsException.php   账号密码错误
+│   ├── SmsCodeInvalidException.php       短信验证码错误
+│   ├── TokenLeakException.php            Token 泄露
+│   ├── DeviceKickedException.php         设备被踢
+│   ├── UserDisabledException.php         用户被禁用
+│   ├── SmsSendTooFrequentException.php   短信频率过高
+│   └── RefreshTokenExpiredException.php  Refresh Token 过期
+├── Order/
+│   ├── OrderNotFoundException.php        订单不存在
+│   ├── OrderStatusException.php          订单状态流转错误
+│   ├── DuplicateOrderException.php       重复下单
+│   └── OrderExpiredException.php         订单超时
+├── Payment/
+│   ├── PaymentGatewayException.php       支付网关异常
+│   ├── PaymentCallbackInvalidException.php 回调验签失败
+│   └── PaymentAlreadyPaidException.php   重复支付
+├── Stock/
+│   └── InsufficientStockException.php    库存不足
+├── Coupon/
+│   ├── CouponExpiredException.php        优惠券过期
+│   ├── CouponAlreadyClaimedException.php 重复领券
+│   ├── CouponDepletedException.php       优惠券领完
+│   └── CouponNotApplicableException.php  不满足使用条件
+└── Address/
+    └── AddressLimitExceededException.php 地址数量超限
+```
+
+---
+
+### 8.3 日志分层体系
+
+#### 设计原则
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    日志分层架构                                      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                     应用层日志 (Application)                  │   │
+│  │                                                              │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │   │
+│  │  │ business │  │  error   │  │ security │  │  queue   │   │   │
+│  │  │ 业务操作  │  │ 系统错误  │  │ 安全事件  │  │ 队列任务  │   │   │
+│  │  │ warning  │  │ error    │  │ notice   │  │ info     │   │   │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                   请求层日志 (Request)                        │   │
+│  │                                                              │   │
+│  │  ┌──────────────────┐  ┌─────────────────────────────┐      │   │
+│  │  │ request          │  │ payment_callback            │      │   │
+│  │  │ API 请求全链路    │  │ 支付回调独立日志             │      │   │
+│  │  │ 请求+响应+耗时    │  │ 完整请求体+处理结果          │      │   │
+│  │  └──────────────────┘  └─────────────────────────────┘      │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                   数据层日志 (Database)                       │   │
+│  │                                                              │   │
+│  │  ┌──────────┐  ┌──────────────┐  ┌──────────────────┐      │   │
+│  │  │ sql      │  │ slow_query   │  │ n_plus_one       │      │   │
+│  │  │ 全部SQL   │  │ 慢查询(>1s)  │  │ N+1 查询检测     │      │   │
+│  │  │ dev only │  │ all env      │  │ dev only         │      │   │
+│  │  └──────────┘  └──────────────┘  └──────────────────┘      │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 日志通道配置 (config/logging.php)
+
+```php
+// config/logging.php
+return [
+    'default' => env('LOG_CHANNEL', 'daily'),
+
+    'channels' => [
+
+        // ========== 默认通道（Laravel 框架日志） ==========
+        'daily' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/laravel.log'),
+            'level'  => 'debug',
+            'days'   => 30,
+        ],
+
+        // ========== 应用层日志 ==========
+
+        // 业务操作日志（业务异常、重要操作记录）
+        'business' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/business/business.log'),
+            'level'  => 'info',
+            'days'   => 60,
+        ],
+
+        // 系统错误日志（未捕获异常、500 错误）
+        'error' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/error/error.log'),
+            'level'  => 'error',
+            'days'   => 90, // 错误日志保留更久
+        ],
+
+        // 安全事件日志（登录、Token 刷新、泄露检测、踢设备）
+        'security' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/security/security.log'),
+            'level'  => 'info',
+            'days'   => 180, // 安全日志保留半年
+        ],
+
+        // 队列任务日志
+        'queue' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/queue/queue.log'),
+            'level'  => 'info',
+            'days'   => 30,
+        ],
+
+        // ========== 请求层日志 ==========
+
+        // API 请求日志（请求/响应/耗时）
+        'request' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/request/api.log'),
+            'level'  => 'info',
+            'days'   => 14, // 量大，只保留 14 天
+        ],
+
+        // 支付回调专用日志（最高优先级保留）
+        'payment_callback' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/payment/callback.log'),
+            'level'  => 'info',
+            'days'   => 365, // 支付日志保留一年（对账需要）
+        ],
+
+        // ========== 数据层日志 ==========
+
+        // SQL 全量日志（仅开发环境启用）
+        'sql' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/sql/query.log'),
+            'level'  => 'debug',
+            'days'   => 7,
+        ],
+
+        // 慢查询日志（所有环境启用）
+        'slow_query' => [
+            'driver' => 'daily',
+            'path'   => storage_path('logs/sql/slow.log'),
+            'level'  => 'warning',
+            'days'   => 60,
+        ],
+    ],
+];
+```
+
+#### 日志文件目录结构
+
+```
+storage/logs/
+├── laravel-2026-03-26.log             Laravel 框架日志
+├── business/
+│   └── business-2026-03-26.log        业务操作日志
+├── error/
+│   └── error-2026-03-26.log           系统错误日志
+├── security/
+│   └── security-2026-03-26.log        安全事件日志
+├── queue/
+│   └── queue-2026-03-26.log           队列任务日志
+├── request/
+│   └── api-2026-03-26.log             API 请求日志
+├── payment/
+│   └── callback-2026-03-26.log        支付回调日志
+└── sql/
+    ├── query-2026-03-26.log           SQL 全量日志 (dev)
+    └── slow-2026-03-26.log            慢查询日志
+```
+
+---
+
+### 8.4 请求全链路日志中间件
+
+#### RequestLog 中间件
+
+```php
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Log;
+
+class RequestLog
+{
+    /**
+     * 排除日志记录的路由（健康检查等）
+     */
+    protected array $except = [
+        'api/health',
+        'api/v1/ping',
+    ];
+
+    /**
+     * 敏感字段脱敏（不记录到日志）
+     */
+    protected array $sensitiveFields = [
+        'password',
+        'password_confirmation',
+        'sms_code',
+        'id_card',
+        'bank_card',
+    ];
+
+    public function handle(Request $request, Closure $next)
+    {
+        // 跳过排除路由
+        if ($request->is(...$this->except)) {
+            return $next($request);
+        }
+
+        // 生成请求唯一 ID（全链路追踪）
+        $requestId = $request->header('X-Request-Id') ?: Str::uuid()->toString();
+        $request->headers->set('X-Request-Id', $requestId);
+
+        $startTime = microtime(true);
+
+        // 执行请求
+        $response = $next($request);
+
+        $duration = round((microtime(true) - $startTime) * 1000, 2); // 毫秒
+
+        // 记录日志
+        Log::channel('request')->info('API Request', [
+            'request_id' => $requestId,
+            'method'     => $request->method(),
+            'url'        => $request->fullUrl(),
+            'ip'         => $request->ip(),
+            'user_agent' => Str::limit($request->userAgent(), 200),
+            'user_id'    => auth()->id(),
+            'platform'   => $request->header('X-Platform', 'unknown'),
+            'input'      => $this->filterSensitive($request->all()),
+            'status'     => $response->getStatusCode(),
+            'duration'   => $duration . 'ms',
+            'response_size' => strlen($response->getContent()),
+        ]);
+
+        // 响应头带上 request_id（方便前端排障）
+        $response->headers->set('X-Request-Id', $requestId);
+        $response->headers->set('X-Response-Time', $duration . 'ms');
+
+        // 慢请求告警（>3s）
+        if ($duration > 3000) {
+            Log::channel('error')->warning('Slow Request', [
+                'request_id' => $requestId,
+                'url'        => $request->fullUrl(),
+                'duration'   => $duration . 'ms',
+                'user_id'    => auth()->id(),
+            ]);
+        }
+
+        return $response;
+    }
+
+    /**
+     * 过滤敏感字段
+     */
+    protected function filterSensitive(array $data): array
+    {
+        foreach ($this->sensitiveFields as $field) {
+            if (isset($data[$field])) {
+                $data[$field] = '***';
+            }
+        }
+        return $data;
+    }
+}
+```
+
+#### 请求日志示例输出
+
+```
+[2026-03-26 10:30:15] request.INFO: API Request {
+    "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "method": "POST",
+    "url": "https://api.shop.com/api/v1/orders",
+    "ip": "223.104.63.xx",
+    "user_agent": "ShopApp/2.1.0 (iPhone; iOS 17.4)",
+    "user_id": 10001,
+    "platform": "app",
+    "input": {
+        "address_id": 5,
+        "coupon_id": 12,
+        "items": [{"sku_id": 101, "quantity": 2}],
+        "idempotency_token": "abc123"
+    },
+    "status": 200,
+    "duration": "156.32ms",
+    "response_size": 1234
+}
+```
+
+#### 支付回调专用日志
+
+```php
+// 在 PaymentCallbackController 中
+
+public function wechatNotify(Request $request)
+{
+    $rawBody = $request->getContent();
+
+    // 1. 记录原始回调（无论成功失败都记录）
+    Log::channel('payment_callback')->info('WeChat Callback Received', [
+        'headers' => $request->headers->all(),
+        'body'    => $rawBody,
+        'ip'      => $request->ip(),
+    ]);
+
+    try {
+        $result = $this->paymentService->handleWechatCallback($rawBody, $request->headers);
+
+        Log::channel('payment_callback')->info('WeChat Callback Processed', [
+            'order_no'   => $result['order_no'],
+            'payment_no' => $result['payment_no'],
+            'amount'     => $result['amount'],
+            'result'     => 'success',
+        ]);
+
+        return response('SUCCESS', 200);
+    } catch (\Throwable $e) {
+        Log::channel('payment_callback')->error('WeChat Callback Failed', [
+            'error'   => $e->getMessage(),
+            'body'    => $rawBody,
+            'trace'   => $e->getTraceAsString(),
+        ]);
+
+        return response('FAIL', 500);
+    }
+}
+```
+
+---
+
+### 8.5 安全事件日志
+
+```php
+namespace App\Services\Auth;
+
+use Illuminate\Support\Facades\Log;
+
+trait LogsSecurityEvent
+{
+    protected function logSecurityEvent(string $event, array $context = []): void
+    {
+        Log::channel('security')->notice("Security: {$event}", array_merge([
+            'user_id'    => auth()->id(),
+            'ip'         => request()->ip(),
+            'user_agent' => request()->userAgent(),
+            'platform'   => request()->header('X-Platform', 'unknown'),
+            'timestamp'  => now()->toISOString(),
+        ], $context));
+    }
+}
+
+// 使用示例（在 AuthService 中）：
+// $this->logSecurityEvent('login_success', ['method' => 'password', 'phone' => '138****1234']);
+// $this->logSecurityEvent('token_refreshed', ['old_jti' => 'xxx', 'new_jti' => 'yyy']);
+// $this->logSecurityEvent('token_leak_detected', ['jti' => 'xxx', 'platform' => 'app']);
+// $this->logSecurityEvent('device_kicked', ['kicked_token_id' => 5]);
+// $this->logSecurityEvent('password_changed', ['user_id' => 10001]);
+// $this->logSecurityEvent('phone_changed', ['old_phone' => '138****1234', 'new_phone' => '139****5678']);
+```
+
+#### 安全日志示例
+
+```
+[2026-03-26 10:30:15] security.NOTICE: Security: login_success {
+    "user_id": 10001,
+    "ip": "223.104.63.xx",
+    "user_agent": "ShopApp/2.1.0",
+    "platform": "app",
+    "timestamp": "2026-03-26T10:30:15+08:00",
+    "method": "password",
+    "phone": "138****1234"
+}
+
+[2026-03-26 10:32:00] security.NOTICE: Security: token_leak_detected {
+    "user_id": 10001,
+    "ip": "45.227.xx.xx",           ← 异常 IP
+    "user_agent": "python-requests/2.28",  ← 异常 UA
+    "platform": "app",
+    "timestamp": "2026-03-26T10:32:00+08:00",
+    "jti": "a1b2c3d4e5f6"
+}
+```
+
+---
+
+### 8.6 SQL 查询日志与慢查询监控
+
+#### 设计思路
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                SQL 日志三道防线                                    │
+│                                                                  │
+│  第一道：SQL 全量日志（开发环境）                                  │
+│  ├── 记录每一条 SQL 语句、绑定参数、执行时间                       │
+│  ├── 仅在 APP_DEBUG=true 时启用                                  │
+│  └── 目的：开发阶段发现潜在问题                                   │
+│                                                                  │
+│  第二道：慢查询日志（所有环境）                                    │
+│  ├── 记录执行时间 > 阈值的 SQL                                   │
+│  ├── 阈值: 开发 500ms / 生产 1000ms（可配置）                    │
+│  ├── 含调用堆栈，可追溯到代码位置                                 │
+│  └── 目的：及时发现性能瓶颈                                      │
+│                                                                  │
+│  第三道：N+1 查询检测（开发环境）                                  │
+│  ├── 单次请求内同一 SQL 模式执行 > N 次                           │
+│  ├── 阈值: 5 次（可配置）                                        │
+│  └── 目的：发现漏掉的预加载(with/load)                            │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### SQL 日志 ServiceProvider
+
+```php
+namespace App\Providers;
+
+use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Database\Events\QueryExecuted;
+
+class SqlLogServiceProvider extends ServiceProvider
+{
+    public function boot(): void
+    {
+        // 仅在非 testing 环境启用
+        if ($this->app->environment('testing')) {
+            return;
+        }
+
+        DB::listen(function (QueryExecuted $query) {
+            $sql      = $query->sql;
+            $bindings = $query->bindings;
+            $time     = $query->time; // 毫秒
+            $connection = $query->connectionName;
+
+            // ── 第一道防线：全量 SQL 日志（仅开发环境） ──
+            if (config('app.debug')) {
+                Log::channel('sql')->debug('SQL', [
+                    'sql'        => $this->formatSql($sql, $bindings),
+                    'time'       => $time . 'ms',
+                    'connection' => $connection,
+                ]);
+            }
+
+            // ── 第二道防线：慢查询日志（所有环境） ──
+            $slowThreshold = config('database.slow_query_threshold', 1000); // 默认 1000ms
+
+            if ($time >= $slowThreshold) {
+                $caller = $this->getCallerInfo();
+
+                Log::channel('slow_query')->warning('Slow Query Detected', [
+                    'sql'        => $this->formatSql($sql, $bindings),
+                    'time'       => $time . 'ms',
+                    'threshold'  => $slowThreshold . 'ms',
+                    'connection' => $connection,
+                    'caller'     => $caller,
+                    'request_id' => request()->header('X-Request-Id'),
+                    'url'        => request()->fullUrl(),
+                    'user_id'    => auth()->id(),
+                ]);
+            }
+
+            // ── 第三道防线：N+1 检测（仅开发环境） ──
+            if (config('app.debug')) {
+                $this->detectNPlusOne($sql, $time);
+            }
+        });
+    }
+
+    /**
+     * 将绑定参数替换到 SQL 中，生成可直接执行的完整 SQL
+     */
+    protected function formatSql(string $sql, array $bindings): string
+    {
+        foreach ($bindings as $binding) {
+            $value = match (true) {
+                is_null($binding)   => 'NULL',
+                is_bool($binding)   => $binding ? 'TRUE' : 'FALSE',
+                is_int($binding), is_float($binding) => (string) $binding,
+                default             => "'" . addslashes((string) $binding) . "'",
+            };
+            // 逐个替换 ?
+            $sql = preg_replace('/\?/', $value, $sql, 1);
+        }
+        return $sql;
+    }
+
+    /**
+     * 获取调用者信息（跳过框架内部堆栈）
+     */
+    protected function getCallerInfo(): string
+    {
+        $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 30);
+
+        foreach ($trace as $frame) {
+            $file = $frame['file'] ?? '';
+            // 跳过框架内部、本文件
+            if (str_contains($file, '/vendor/') || str_contains($file, 'SqlLogServiceProvider')) {
+                continue;
+            }
+            if (str_starts_with($file, app_path()) || str_starts_with($file, base_path('app'))) {
+                return ($frame['file'] ?? '?') . ':' . ($frame['line'] ?? '?');
+            }
+        }
+
+        return 'unknown';
+    }
+
+    /**
+     * N+1 查询检测
+     * 原理：在单次请求中，统计相同 SQL 模式的出现次数
+     */
+    protected function detectNPlusOne(string $sql, float $time): void
+    {
+        // 提取 SQL 模式（去掉具体的值，只保留结构）
+        $pattern = preg_replace('/\b\d+\b/', '?', $sql);
+        $pattern = preg_replace("/'.+?'/", '?', $pattern);
+
+        // 使用请求级别的计数器
+        static $queryPatterns = [];
+
+        if (!isset($queryPatterns[$pattern])) {
+            $queryPatterns[$pattern] = ['count' => 0, 'total_time' => 0];
+        }
+        $queryPatterns[$pattern]['count']++;
+        $queryPatterns[$pattern]['total_time'] += $time;
+
+        $threshold = config('database.n_plus_one_threshold', 5);
+
+        if ($queryPatterns[$pattern]['count'] === $threshold) {
+            Log::channel('slow_query')->warning('N+1 Query Detected', [
+                'pattern'    => $pattern,
+                'count'      => $queryPatterns[$pattern]['count'],
+                'total_time' => round($queryPatterns[$pattern]['total_time'], 2) . 'ms',
+                'suggestion' => '请检查是否遗漏了 with() 预加载',
+                'url'        => request()->fullUrl(),
+                'request_id' => request()->header('X-Request-Id'),
+            ]);
+        }
+
+        // 请求结束时自动 GC (利用 terminate 中间件或 PHP 请求生命周期)
+    }
+}
+```
+
+#### 配置项 (config/database.php 追加)
+
+```php
+// config/database.php 追加以下配置
+
+// 慢查询阈值（毫秒）
+'slow_query_threshold' => env('DB_SLOW_QUERY_THRESHOLD', 1000),
+
+// N+1 检测阈值（同一 SQL 模式在单次请求中的最大次数）
+'n_plus_one_threshold' => env('DB_N_PLUS_ONE_THRESHOLD', 5),
+```
+
+#### SQL 全量日志示例（开发环境）
+
+```
+[2026-03-26 10:30:15] sql.DEBUG: SQL {
+    "sql": "SELECT * FROM `products` WHERE `id` = 42 AND `status` = 'active' LIMIT 1",
+    "time": "2.15ms",
+    "connection": "mysql"
+}
+
+[2026-03-26 10:30:15] sql.DEBUG: SQL {
+    "sql": "SELECT * FROM `product_skus` WHERE `product_id` IN (42, 43, 44)",
+    "time": "1.87ms",
+    "connection": "mysql"
+}
+
+[2026-03-26 10:30:15] sql.DEBUG: SQL {
+    "sql": "UPDATE `product_skus` SET `stock` = `stock` - 2 WHERE `id` = 101 AND `stock` >= 2",
+    "time": "8.34ms",
+    "connection": "mysql"
+}
+```
+
+#### 慢查询日志示例（所有环境）
+
+```
+[2026-03-26 10:30:15] slow_query.WARNING: Slow Query Detected {
+    "sql": "SELECT p.*, GROUP_CONCAT(t.name) as tags FROM `products` p LEFT JOIN `product_tags` t ON p.id = t.product_id WHERE p.category_id = 5 AND p.status = 'active' GROUP BY p.id ORDER BY p.sort_order ASC, p.created_at DESC LIMIT 20 OFFSET 0",
+    "time": "2341.56ms",
+    "threshold": "1000ms",
+    "connection": "mysql",
+    "caller": "/app/Repositories/Eloquent/ProductRepository.php:156",
+    "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "url": "https://api.shop.com/api/v1/products?category_id=5&page=1",
+    "user_id": null
+}
+```
+
+#### N+1 检测日志示例
+
+```
+[2026-03-26 10:30:15] slow_query.WARNING: N+1 Query Detected {
+    "pattern": "SELECT * FROM `product_images` WHERE `product_id` = ? LIMIT ?",
+    "count": 5,
+    "total_time": "12.45ms",
+    "suggestion": "请检查是否遗漏了 with() 预加载",
+    "url": "https://api.shop.com/api/v1/products",
+    "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+
+修复方法：
+  ✗ Product::where('category_id', 5)->get();       // 循环中再查 images → N+1
+  ✓ Product::with('images')->where('category_id', 5)->get(); // 预加载
+```
+
+---
+
+### 8.7 不同环境的日志策略
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              环境       日志通道                   启用状态          │
+│  ──────────────────────────────────────────────────────────────     │
+│  local (开发)                                                      │
+│  ├── business          ✅ 记录                                     │
+│  ├── error             ✅ 记录                                     │
+│  ├── security          ✅ 记录                                     │
+│  ├── request           ✅ 记录（含完整 input）                      │
+│  ├── payment_callback  ✅ 记录                                     │
+│  ├── sql               ✅ 全量记录（每条 SQL）                      │
+│  ├── slow_query        ✅ 阈值 500ms                               │
+│  └── n+1 检测          ✅ 阈值 5 次                                │
+│                                                                     │
+│  production (生产)                                                  │
+│  ├── business          ✅ 记录                                     │
+│  ├── error             ✅ 记录（含完整堆栈）                        │
+│  ├── security          ✅ 记录                                     │
+│  ├── request           ✅ 记录（排除 input 中的大字段）              │
+│  ├── payment_callback  ✅ 记录（保留 365 天）                       │
+│  ├── sql               ❌ 关闭（性能考虑）                          │
+│  ├── slow_query        ✅ 阈值 1000ms                              │
+│  └── n+1 检测          ❌ 关闭                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+.env 配置示例：
+
+# 开发环境
+APP_DEBUG=true
+DB_SLOW_QUERY_THRESHOLD=500
+DB_N_PLUS_ONE_THRESHOLD=5
+
+# 生产环境
+APP_DEBUG=false
+DB_SLOW_QUERY_THRESHOLD=1000
+DB_N_PLUS_ONE_THRESHOLD=0      # 0 表示不检测
+```
+
+---
+
+### 8.8 日志与目录结构更新
+
+```
+app/
+├── Exceptions/                      异常分层目录
+│   ├── BusinessException.php        业务异常基类
+│   ├── RateLimitExceededException.php
+│   ├── ForbiddenException.php
+│   ├── Auth/                        认证模块异常 (7 个)
+│   ├── Order/                       订单模块异常 (4 个)
+│   ├── Payment/                     支付模块异常 (3 个)
+│   ├── Stock/                       库存模块异常 (1 个)
+│   ├── Coupon/                      优惠券模块异常 (4 个)
+│   └── Address/                     地址模块异常 (1 个)
+│
+├── Http/
+│   ├── Middleware/
+│   │   ├── ... (已有中间件)
+│   │   └── RequestLog               请求全链路日志中间件
+│   └── ...
+│
+├── Providers/
+│   ├── ... (已有 Provider)
+│   └── SqlLogServiceProvider        SQL 日志服务提供者
+│
+├── Services/
+│   └── Auth/
+│       └── LogsSecurityEvent.php    安全事件日志 Trait
+│
+resources/lua/                       (已有 Lua 脚本)
+```
+
+---
+
+### 8.9 慢查询排查与优化检查清单
+
+```
+发现慢查询后的标准排查流程：
+
+1. 看日志 → 定位 SQL 和调用位置
+   └── storage/logs/sql/slow.log → caller 字段
+
+2. EXPLAIN 分析 → 查看执行计划
+   └── EXPLAIN SELECT ... (看 type/rows/Extra)
+
+   重点关注：
+   ┌──────────┬────────────────────────────────────┐
+   │ 指标      │ 危险信号                            │
+   ├──────────┼────────────────────────────────────┤
+   │ type     │ ALL (全表扫描)                       │
+   │ rows     │ > 10000                             │
+   │ Extra    │ Using filesort, Using temporary     │
+   │ key      │ NULL (未使用索引)                    │
+   └──────────┴────────────────────────────────────┘
+
+3. 优化方案选择：
+   ┌──────────────────────────┬───────────────────────────────┐
+   │ 问题                     │ 解决方案                       │
+   ├──────────────────────────┼───────────────────────────────┤
+   │ 缺少索引                  │ 添加合适的索引 (单列/联合)     │
+   │ 索引失效 (函数/隐式转换)   │ 改写 SQL / 调整字段类型        │
+   │ 大量数据 JOIN             │ 分拆查询 / 冗余字段            │
+   │ LIKE '%xxx'              │ 改用 Elasticsearch 全文搜索     │
+   │ ORDER BY + LIMIT 深分页   │ 改用 cursor-based 分页         │
+   │ N+1 查询                  │ Eager Loading (with/load)     │
+   │ COUNT(*) 大表             │ Redis 计数器 / 估算值          │
+   └──────────────────────────┴───────────────────────────────┘
+
+4. 验证 → 优化后重新 EXPLAIN，确认执行计划改善
+
+5. 记录 → 将优化方案记录到代码注释中
+```
 
 ## 9. 测试策略
 
