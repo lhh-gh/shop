@@ -3,13 +3,11 @@
 namespace App\Support;
 
 use Illuminate\Http\JsonResponse;
+use Illuminate\Pagination\LengthAwarePaginator;
 
-class ApiResponse
+trait ApiResponse
 {
-    /**
-     * 成功响应
-     */
-    public static function success(mixed $data = null, string $message = 'success', int $httpStatus = 200): JsonResponse
+    protected function success(mixed $data = null, string $message = 'success', int $httpStatus = 200): JsonResponse
     {
         return response()->json([
             'code'    => 0,
@@ -18,35 +16,29 @@ class ApiResponse
         ], $httpStatus);
     }
 
-    /**
-     * 创建成功
-     */
-    public static function created(mixed $data = null, string $message = 'created'): JsonResponse
-    {
-        return static::success($data, $message, 201);
-    }
-
-    /**
-     * 无内容成功
-     */
-    public static function noContent(): JsonResponse
+    protected function fail(int $code, string $message, int $httpStatus = 400, ?array $data = null): JsonResponse
     {
         return response()->json([
-            'code'    => 0,
-            'message' => 'success',
-            'data'    => null,
-        ], 200);
-    }
-
-    /**
-     * 错误响应
-     */
-    public static function error(int $errorCode, string $message, int $httpStatus = 400, mixed $data = null): JsonResponse
-    {
-        return response()->json([
-            'code'    => $errorCode,
+            'code'    => $code,
             'message' => $message,
             'data'    => $data,
         ], $httpStatus);
+    }
+
+    protected function paginated(LengthAwarePaginator $paginator, string $message = 'success'): JsonResponse
+    {
+        return response()->json([
+            'code'    => 0,
+            'message' => $message,
+            'data'    => [
+                'items'      => $paginator->items(),
+                'pagination' => [
+                    'total'        => $paginator->total(),
+                    'per_page'     => $paginator->perPage(),
+                    'current_page' => $paginator->currentPage(),
+                    'last_page'    => $paginator->lastPage(),
+                ],
+            ],
+        ]);
     }
 }
