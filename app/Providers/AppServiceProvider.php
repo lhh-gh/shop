@@ -12,6 +12,20 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->register(SqlLogServiceProvider::class);
+
+        // Bind repository interfaces to implementations
+        $this->app->bind(
+            \App\Repositories\Contracts\UserRepositoryInterface::class,
+            \App\Repositories\UserRepository::class
+        );
+        $this->app->bind(
+            \App\Repositories\Contracts\UserTokenRepositoryInterface::class,
+            \App\Repositories\UserTokenRepository::class
+        );
+        $this->app->bind(
+            \App\Repositories\Contracts\SecurityLogRepositoryInterface::class,
+            \App\Repositories\SecurityLogRepository::class
+        );
     }
 
     /**
