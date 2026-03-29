@@ -19,8 +19,17 @@ return Application::configure(basePath: dirname(__DIR__))
         apiPrefix: 'api/v1',
     )
     ->withMiddleware(function (Middleware $middleware): void {
+        // ──── 全局 API 中间件 ────
         $middleware->api(append: [
             \App\Http\Middleware\RequestLog::class,
+        ]);
+
+        // ──── 中间件别名注册 ────
+        $middleware->alias([
+            'platform.identify' => \App\Http\Middleware\PlatformIdentify::class,
+            'jwt.auth'          => \App\Http\Middleware\JwtAuthenticate::class,
+            'jwt.blacklist'     => \App\Http\Middleware\JwtBlacklist::class,
+            'db.check'          => \App\Http\Middleware\OptionalDatabaseCheck::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
