@@ -148,7 +148,15 @@ return Application::configure(basePath: dirname(__DIR__))
                 'trace'     => $e->getTraceAsString(),
                 'user_id'   => auth()->id(),
                 'url'       => request()->fullUrl(),
-                'input'     => request()->except(['password', 'password_confirmation']),
+                'input'     => request()->except([
+                    'password',
+                    'password_confirmation',
+                    'sms_code',
+                    'code',
+                    'refresh_token',
+                    'access_token',
+                    'token',
+                ]),
                 'ip'        => request()->ip(),
             ]);
         });

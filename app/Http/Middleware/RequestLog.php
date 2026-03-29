@@ -26,6 +26,10 @@ class RequestLog
         'password',
         'password_confirmation',
         'sms_code',
+        'code',
+        'refresh_token',
+        'access_token',
+        'token',
         'id_card',
         'bank_card',
     ];

@@ -136,10 +136,9 @@ class DeviceService
         $this->securityLogRepository->create([
             'user_id' => $userId,
             'event' => $event,
-            'ip_address' => request()->ip(),
+            'ip' => request()->ip(),
             'user_agent' => request()->userAgent(),
-            'context' => $context,
+            'detail' => $context,
         ]);
     }
 }
-

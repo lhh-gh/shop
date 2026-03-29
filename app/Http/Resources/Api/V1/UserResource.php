@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Http\Resources;
+namespace App\Http\Resources\Api\V1;
 
 use App\Support\DataMasker;
 use Illuminate\Http\Request;

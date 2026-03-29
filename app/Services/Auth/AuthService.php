@@ -15,7 +15,7 @@ use App\Models\UserSocialAccount;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
-use App\Http\Resources\UserResource;
+use App\Http\Resources\Api\V1\UserResource;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
@@ -159,8 +159,36 @@ class AuthService
             throw new RefreshTokenExpiredException();
         }
 
+        $storedPlatform = $tokenRecord->platform;
+
+        if ($platform !== $storedPlatform) {
+            Log::channel('security')->warning('Refresh token platform mismatch', [
+                'user_id' => $tokenRecord->user_id,
+                'stored_platform' => $storedPlatform,
+                'request_platform' => $platform,
+                'ip' => $request->ip(),
+            ]);
+
+            $this->jwtService->blacklist($tokenRecord->last_jwt_jti, 7200);
+            $this->tokenRepository->deleteByUserAndPlatform($tokenRecord->user_id, $storedPlatform);
+
+            $this->securityLogRepository->create([
+                'user_id' => $tokenRecord->user_id,
+                'event' => 'token_leak',
+                'detail' => [
+                    'reason' => 'platform_mismatch',
+                    'stored_platform' => $storedPlatform,
+                    'request_platform' => $platform,
+                ],
+                'ip' => $request->ip(),
+                'user_agent' => Str::limit($request->userAgent() ?? '', 500),
+            ]);
+
+            throw new TokenLeakException($tokenRecord->user_id, $storedPlatform);
+        }
+
         // 2. Leak detection
-        $this->detectLeak($tokenRecord, $request, $platform);
+        $this->detectLeak($tokenRecord, $request, $storedPlatform);
 
         // 3. Load user
         $user = $tokenRecord->user;
@@ -171,7 +199,7 @@ class AuthService
 
         // 5. Generate new JWT
         $deviceName = $tokenRecord->device_name ?? $this->parseDeviceName($request);
-        $jwtData = $this->jwtService->generate($user, $platform, $deviceName);
+        $jwtData = $this->jwtService->generate($user, $storedPlatform, $deviceName);
 
         // 6. Rotate refresh token
         $newRawToken = Str::random(64);
@@ -185,7 +213,7 @@ class AuthService
 
         $this->logSecurityEvent('token_refresh', [
             'user_id'  => $user->id,
-            'platform' => $platform,
+            'platform' => $storedPlatform,
         ]);
 
         return $this->formatTokenResponse($user, $jwtData['jwt'], $newRawToken);
