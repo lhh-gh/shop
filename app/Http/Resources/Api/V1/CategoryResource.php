@@ -1,11 +1,11 @@
 <?php
 
-namespace App\Http\Resources;
+namespace App\Http\Resources\Api\V1;
 
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
-class ProductAttributeResource extends JsonResource
+class CategoryResource extends JsonResource
 {
     /**
      * Transform the resource into an array.
@@ -16,9 +16,13 @@ class ProductAttributeResource extends JsonResource
     {
         return [
             'id' => $this->id,
+            'parent_id' => $this->parent_id,
             'name' => $this->name,
-            'values' => $this->values,
+            'icon' => $this->icon,
             'sort_order' => $this->sort_order,
+            'is_enabled' => $this->is_enabled,
+            'level' => $this->level,
+            'children' => CategoryResource::collection($this->whenLoaded('children')),
         ];
     }
 }

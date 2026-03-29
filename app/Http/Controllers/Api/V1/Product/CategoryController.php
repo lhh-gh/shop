@@ -1,10 +1,10 @@
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Http\Controllers\Api\V1\Product;
 
 use App\Http\Controllers\Controller;
-use App\Models\Category;
-use App\Http\Resources\CategoryResource;
+use App\Repositories\Contracts\CategoryRepositoryInterface;
+use App\Http\Resources\Api\V1\CategoryResource;
 use Illuminate\Http\JsonResponse;
 
 /**
@@ -12,6 +12,13 @@ use Illuminate\Http\JsonResponse;
  */
 class CategoryController extends Controller
 {
+    private CategoryRepositoryInterface $categoryRepo;
+
+    public function __construct(CategoryRepositoryInterface $categoryRepo)
+    {
+        $this->categoryRepo = $categoryRepo;
+    }
+
     /**
      * 获取所有顶层分类及其子分类（树形结构）
      * 
@@ -19,13 +26,7 @@ class CategoryController extends Controller
      */
     public function index(): JsonResponse
     {
-        $categories = Category::where('parent_id', 0)
-            ->where('is_enabled', 1)
-            ->with(['children' => function ($query) {
-                $query->where('is_enabled', 1)->orderBy('sort_order', 'asc');
-            }])
-            ->orderBy('sort_order', 'asc')
-            ->get();
+        $categories = $this->categoryRepo->getCategoryTree();
 
         $data = CategoryResource::collection($categories)->resolve();
 

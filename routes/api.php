@@ -1,10 +1,10 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
-use App\Http\Controllers\Api\CategoryController;
+use App\Http\Controllers\Api\V1\Product\CategoryController;
 use App\Http\Controllers\Api\DeviceController;
 use App\Http\Controllers\Api\HealthController;
-use App\Http\Controllers\Api\ProductController;
+use App\Http\Controllers\Api\V1\Product\ProductController;
 use App\Http\Controllers\Api\TokenController;
 use Illuminate\Support\Facades\Route;
 

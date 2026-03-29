@@ -1,12 +1,11 @@
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Http\Controllers\Api\V1\Product;
 
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
-
-use App\Models\Product;
-use App\Http\Resources\ProductResource;
+use App\Services\Product\ProductService;
+use App\Http\Resources\Api\V1\ProductResource;
 use Illuminate\Http\JsonResponse;
 
 /**
@@ -14,6 +13,13 @@ use Illuminate\Http\JsonResponse;
  */
 class ProductController extends Controller
 {
+    private ProductService $productService;
+
+    public function __construct(ProductService $productService)
+    {
+        $this->productService = $productService;
+    }
+
     /**
      * 获取上架商品列表（支持分页及条件过滤）
      * 
@@ -21,18 +27,10 @@ class ProductController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $query = Product::where('status', 1)->with(['category']);
-
-        if ($request->filled('category_id')) {
-            $query->where('category_id', $request->input('category_id'));
-        }
-
-        if ($request->filled('keyword')) {
-            $query->where('title', 'like', '%' . $request->input('keyword') . '%');
-        }
-
+        $filters = $request->only(['category_id', 'keyword']);
         $limit = (int) $request->input('limit', 15);
-        $paginator = $query->orderBy('id', 'desc')->paginate($limit);
+
+        $paginator = $this->productService->getList($filters, $limit);
 
         $paginator->through(fn ($product) => (new ProductResource($product))->resolve());
 
@@ -46,9 +44,7 @@ class ProductController extends Controller
      */
     public function show(int $id): JsonResponse
     {
-        $product = Product::where('status', 1)
-            ->with(['category', 'skus', 'attributes'])
-            ->findOrFail($id);
+        $product = $this->productService->getDetail($id);
 
         $data = (new ProductResource($product))->resolve();
 
