@@ -27,6 +27,16 @@ class SocialAuthManager extends Manager
         return new WeChatAuthProvider();
     }
 
+    protected function createWechatAppDriver(): SocialAuthProviderInterface
+    {
+        return new WeChatAuthProvider();
+    }
+
+    protected function createWechatMiniDriver(): SocialAuthProviderInterface
+    {
+        return new WeChatAuthProvider();
+    }
+
     /**
      * Create an instance of the Alipay driver.
      *

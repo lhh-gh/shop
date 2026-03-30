@@ -111,8 +111,8 @@ class DeviceServiceTest extends TestCase
             ->with($userId)
             ->andReturn(new Collection([$token]));
 
-        // Mock request to return 'web' platform
-        request()->headers->set('X-Platform', 'web');
+        request()->attributes->set('jwt_platform', 'web');
+        request()->headers->set('X-Platform', 'ios');
 
         $result = $this->service->list($userId);
 
@@ -156,10 +156,11 @@ class DeviceServiceTest extends TestCase
             ->with(Mockery::on(function ($data) use ($userId, $platform) {
                 return $data['user_id'] === $userId
                     && $data['event'] === 'device_kicked'
-                    && $data['context']['platform'] === $platform;
+                    && $data['detail']['platform'] === $platform;
             }));
 
         $this->service->kick($userId, $platform);
+        $this->addToAssertionCount(1);
     }
 
     public function test_kick_does_nothing_when_token_not_found(): void
@@ -178,6 +179,7 @@ class DeviceServiceTest extends TestCase
         $this->securityLogRepo->shouldNotReceive('create');
 
         $this->service->kick($userId, $platform);
+        $this->addToAssertionCount(1);
     }
 
     public function test_kickAll_blacklists_all_tokens(): void
@@ -228,6 +230,7 @@ class DeviceServiceTest extends TestCase
             ->twice();
 
         $this->service->kickAll($userId);
+        $this->addToAssertionCount(1);
     }
 
     public function test_kickAll_excludes_current_platform(): void
@@ -269,5 +272,6 @@ class DeviceServiceTest extends TestCase
             ->once();
 
         $this->service->kickAll($userId, 'web');
+        $this->addToAssertionCount(1);
     }
 }

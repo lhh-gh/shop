@@ -30,7 +30,10 @@ class DeviceService
             return [];
         }
 
-        $currentPlatform = request()->header('X-Platform', 'unknown');
+        $currentPlatform = request()->attributes->get(
+            'jwt_platform',
+            request()->header('X-Platform', 'unknown')
+        );
 
         return $tokens->map(function ($token) use ($currentPlatform) {
             return [
