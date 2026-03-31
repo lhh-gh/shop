@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginByPasswordRequest;
 use App\Http\Requests\Auth\LoginBySmsRequest;
 use App\Http\Requests\Auth\LoginBySocialRequest;
+use App\Http\Requests\Auth\LoginByWeChatRequest;
 use App\Http\Requests\Auth\SendSmsCodeRequest;
 use App\Services\Auth\AuthService;
 use App\Services\Auth\SmsService;
@@ -55,7 +56,7 @@ class AuthController extends Controller
         return $this->success($result, '登录成功');
     }
 
-    public function loginByWeChat(LoginBySocialRequest $request): JsonResponse
+    public function loginByWeChat(LoginByWeChatRequest $request): JsonResponse
     {
         $platform = $request->attributes->get('platform', $request->header('X-Platform', 'h5'));
 
